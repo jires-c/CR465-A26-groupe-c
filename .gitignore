@@ -1,0 +1,6 @@
+.env
+.DS_Store
+qemu/*.img
+*.img
+*.qcow2
+qemu/*.qcow2
