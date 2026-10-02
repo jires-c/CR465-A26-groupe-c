@@ -1,0 +1,231 @@
+```yaml
+#cloud-config
+#nom de la vm
+hostname: GroupeC-server
+manage_etc_hosts: true
+
+# ============================================================
+# UTILISATEURS
+# ============================================================
+
+users:
+  # Administrateur système
+  - name: admin
+    gecos: Administrateur système
+    shell: /bin/bash
+    groups:
+      - sudo
+    sudo:
+      - "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    #malgre que ce soit une mauvaise pratique, le mot de passe par default est :Admin@123
+    passwd: $6$OK7IZLktGrgTu1mo$ncoblgxj/ayRf9HBkTzPS.oUnhYyFxVBv.Bn4DVLGBlTkxxMEdelbtj/xbew0OeAJrhOHdLpnvBf7v7EafUw00
+    
+  # Utilisateur dédié aux services Docker
+  - name: docker
+    gecos: Utilisateur Docker
+    shell: /bin/bash
+    groups:
+      - docker
+    lock_passwd: true
+    #mot de passe par default est Docker@123
+    passwd: $6$khtx6Pvhmw/uSCqc$WOw9qU8FG3tLyt3Y4rNyeLTtIdKjC4qi9Je6OlZreK7zS1fhbtHZl8DwX9fAoqzeTG/dAHc.7HXrHEBDI/hMH0
+
+# ============================================================
+# PAQUETS DE BASE
+# ============================================================
+
+package_update: true
+package_upgrade: true
+
+packages:
+
+  - ca-certificates
+  - curl
+  - uidmap
+  - openssl
+  - gnupg
+  - lsb-release
+  - git
+  - nano
+  - htop
+  - wget
+  - jq
+  - qemu-guest-agent
+#==================================================================================================
+#Installation de docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+#==================================================================================================
+runcmd:
+  #installation routless docker
+  - user="docker"
+  - iduser="$(id -u "$user")"
+  
+  - curl -fsSL https://get.docker.com/rootless | sh
+  - export PATH=/home/$user/bin:$PATH
+  - export DOCKER_HOST=unix:///run/user/$iduser/docker.sock
+
+  - source ~/.bashrc
+
+  # Ajouter le dépôt officiel Docker
+ # - install -m 0755 -d /etc/apt/keyrings
+  #- curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  #- chmod a+r /etc/apt/keyrings/docker.asc
+
+ # - |
+  #  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+   #   > /etc/apt/sources.list.d/docker.list
+
+  # Installer Docker
+  #- apt-get update
+  #- apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+  # Activer Docker
+  #- systemctl enable --now docker
+# ============================================================
+# INSTALLATION DOCKER
+# ============================================================
+
+runcmd:
+
+  # ----------------------------------------------------------
+  # Préparation du dépôt Docker
+  # ----------------------------------------------------------
+
+ # - install -m 0755 -d /etc/apt/keyrings
+
+  #- curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+
+ # - chmod a+r /etc/apt/keyrings/docker.asc
+
+ # - bash -c 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo ${VERSION_CODENAME}) stable" > /etc/apt/sources.list.d/docker.list'
+
+  # ----------------------------------------------------------
+  # Installation Docker Engine + Compose
+  # ----------------------------------------------------------
+
+ # - apt-get update
+
+  #- apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+  # ----------------------------------------------------------
+  # Activation Docker
+  # ----------------------------------------------------------
+
+  - systemctl enable docker.service
+
+  - systemctl enable containerd.service
+
+  - systemctl start docker
+
+  # ----------------------------------------------------------
+  # Ajouter docker au groupe docker
+  # ----------------------------------------------------------
+
+  - usermod -aG docker docker
+
+  # ----------------------------------------------------------
+  # Création des répertoires applicatifs
+  # ----------------------------------------------------------
+
+  - mkdir -p /opt/docker
+  - mkdir -p /opt/traefik
+  - mkdir -p /opt/apps
+  - mkdir -p /opt/data
+
+  /opt/n8n
+  /opt/keycloak
+  /opt/moodle
+  /opt/openappsec
+  /opt/portainer
+  /opt//postgresql
+  /opt/opencast
+
+
+
+  # ----------------------------------------------------------
+  # Permissions
+  # ----------------------------------------------------------
+
+  - chown -R docker:docker /opt/docker
+  - chown -R docker:docker /opt/traefik
+  - chown -R docker:docker /opt/apps
+  - chown -R docker:docker /opt/data
+
+  - chmod 750 /opt/docker
+  - chmod 750 /opt/traefik
+  - chmod 750 /opt/apps
+  - chmod 750 /opt/data
+
+  # ----------------------------------------------------------
+  # Activer QEMU Guest Agent
+  # ----------------------------------------------------------
+
+  - systemctl enable --now qemu-guest-agent
+
+  # ----------------------------------------------------------
+  # Vérification Docker
+  # ----------------------------------------------------------
+
+  - docker --version
+  - docker compose version
+
+  # ----------------------------------------------------------
+  # Test Docker avec l'utilisateur docker
+  # ----------------------------------------------------------
+
+  - su - docker -c 'docker version'
+  - su - docker -c 'docker compose version'
+
+# ============================================================
+# FICHIERS
+# ============================================================
+
+write_files:
+
+  - path: /opt/docker/README.md
+    owner: docker:docker
+    permissions: "0640"
+    content: |
+      Environnement Docker
+
+      Utilisateur:
+        docker
+
+      Répertoires:
+        /opt/docker
+        /opt/traefik
+        /opt/apps
+        /opt/data
+
+      Docker Compose:
+        docker compose
+
+# ============================================================
+# MESSAGE FINAL
+# ============================================================
+
+final_message: |
+  ============================================================
+  Cloud-Init terminé
+  ============================================================
+
+  Hostname:
+    docker-host
+
+  Utilisateurs:
+    admin  = administration système
+    docker = exécution des services Docker
+
+  Docker:
+    Docker Engine installé
+    Docker Compose installé
+    Docker activé au démarrage
+
+  Répertoires:
+    /opt/docker
+    /opt/traefik
+    /opt/apps
+    /opt/data
+
+  ============================================================
+```
