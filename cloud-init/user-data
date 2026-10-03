@@ -19,7 +19,7 @@ users:
       - "ALL=(ALL) NOPASSWD:ALL"
     lock_passwd: true
     #malgre que ce soit une mauvaise pratique, le mot de passe par default est :Admin@123
-    passwd: $6$OK7IZLktGrgTu1mo$ncoblgxj/ayRf9HBkTzPS.oUnhYyFxVBv.Bn4DVLGBlTkxxMEdelbtj/xbew0OeAJrhOHdLpnvBf7v7EafUw00
+    passwd: "$6$OK7IZLktGrgTu1mo$ncoblgxj/ayRf9HBkTzPS.oUnhYyFxVBv.Bn4DVLGBlTkxxMEdelbtj/xbew0OeAJrhOHdLpnvBf7v7EafUw00"
     
   # Utilisateur dédié aux services Docker
   - name: docker
@@ -29,7 +29,7 @@ users:
       - docker
     lock_passwd: true
     #mot de passe par default est Docker@123
-    passwd: $6$khtx6Pvhmw/uSCqc$WOw9qU8FG3tLyt3Y4rNyeLTtIdKjC4qi9Je6OlZreK7zS1fhbtHZl8DwX9fAoqzeTG/dAHc.7HXrHEBDI/hMH0
+    passwd: "$6$khtx6Pvhmw/uSCqc$WOw9qU8FG3tLyt3Y4rNyeLTtIdKjC4qi9Je6OlZreK7zS1fhbtHZl8DwX9fAoqzeTG/dAHc.7HXrHEBDI/hMH0"
 
 # ============================================================
 # PAQUETS DE BASE
