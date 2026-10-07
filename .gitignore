@@ -1,0 +1,20 @@
+# Secrets et variables d'environnement
+.env
+.env.*
+!.env.example
+
+# Clés privées et certificats contenant une clé privée
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Images de machines virtuelles
+*.img
+*.qcow2
+*.vmdk
+*.vdi
+
+# Fichiers temporaires du système
+.DS_Store
+Thumbs.db

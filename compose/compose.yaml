@@ -1,0 +1,30 @@
+services:
+  traefik:
+    image: traefik:v3.7.13
+    command:
+      - "--entryPoints.web.address=:80"
+      - "--entryPoints.websecure.address=:443"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.endpoint=tcp://socket-proxy:2375"
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - frontend-net
+      - socket-net
+  socket-proxy:
+    image: ghcr.io/tecnativa/docker-socket-proxy:v0.4.2
+    environment:
+      CONTAINERS: 1
+      EVENTS: 1
+      PING: 1
+      VERSION: 1
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    networks:
+      - socket-net
+networks:
+  frontend-net:
+  socket-net:
+    internal: true
