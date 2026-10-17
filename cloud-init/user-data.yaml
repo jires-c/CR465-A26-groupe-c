@@ -1,0 +1,57 @@
+#cloud-config
+# Configuration personnalisee pour l'environnement Mahdi
+ssh_pwauth: false
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - ufw
+  - jq
+  - unzip
+
+users:
+  - default
+  - name: mahdi
+    groups: [sudo, docker]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+
+write_files:
+  - path: /usr/local/bin/setup-docker.sh
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      # Keyring Docker
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+      chmod a+r /etc/apt/keyrings/docker.asc
+
+      # Depot officiel Docker
+      ARCH="$(dpkg --print-architecture)"
+      CODENAME="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")"
+      echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${CODENAME} stable" > /etc/apt/sources.list.d/docker.list
+
+      # Installation des composants Docker
+      apt-get update -y
+      apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      systemctl enable --now docker
+
+runcmd:
+  # 1. Execution du script d'installation Docker
+  - /usr/local/bin/setup-docker.sh
+
+  # 2. Preparation des dossiers workspace
+  - mkdir -p /opt/mahdi-platform/compose
+  - chown -R mahdi:mahdi /opt/mahdi-platform
+
+  # 3. Securisation du pare-feu
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow 22/tcp
+  - ufw --force enable
