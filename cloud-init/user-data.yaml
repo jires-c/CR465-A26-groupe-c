@@ -1,0 +1,46 @@
+
+#cloud-config
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - ufw
+  - jq
+  - unzip
+
+write_files:
+  - path: /usr/local/sbin/install-docker-cr465.sh
+    owner: root:root
+    permissions: '0750'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      install -m 0755 -d /etc/apt/keyrings
+
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        -o /etc/apt/keyrings/docker.asc
+
+      chmod a+r /etc/apt/keyrings/docker.asc
+
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" \
+        > /etc/apt/sources.list.d/docker.list
+
+      apt-get update
+
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        docker-ce \
+        docker-ce-cli \
+        containerd.io \
+        docker-buildx-plugin \
+        docker-compose-plugin
+
+      systemctl enable --now docker
+
+runcmd:
+  - [mkdir, -p, /opt/cr465]
+  - [bash, /usr/local/sbin/install-docker-cr465.sh]
