@@ -1,0 +1,102 @@
+
+name: cr465
+
+services:
+
+  traefik:
+    image: traefik:v3.3
+    container_name: cr465-traefik
+
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:8080:80"
+
+    volumes:
+      - ../traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ../traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+
+    networks:
+      - frontend
+      - backend
+
+    security_opt:
+      - no-new-privileges:true
+
+  postgres:
+    image: postgres:17
+    container_name: cr465-postgres
+
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    networks:
+      - database
+
+    security_opt:
+      - no-new-privileges:true
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4
+    container_name: cr465-keycloak
+
+    restart: unless-stopped
+
+    command:
+      - start-dev
+      - --http-enabled=true
+      - --hostname=http://keycloak.localhost:8080
+
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: ${KEYCLOAK_DB_USER}
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
+
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_BOOTSTRAP_ADMIN_USERNAME}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_BOOTSTRAP_ADMIN_PASSWORD}
+
+      KC_PROXY_HEADERS: xforwarded
+
+    networks:
+      - backend
+      - database
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    security_opt:
+      - no-new-privileges:true
+
+
+volumes:
+  postgres_data:
+
+networks:
+
+  frontend:
+    driver: bridge
+
+  backend:
+    driver: bridge
+
+  database:
+    driver: bridge
+    internal: true

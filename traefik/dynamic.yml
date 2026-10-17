@@ -1,0 +1,21 @@
+
+
+http:
+  routers:
+    dashboard:
+      rule: "Host(`traefik.localhost`)"
+      entryPoints:
+        - web
+      service: api@internal
+
+    keycloak:
+      rule: "Host(`keycloak.localhost`)"
+      entryPoints:
+        - web
+      service: keycloak-service
+
+  services:
+    keycloak-service:
+      loadBalancer:
+        servers:
+          - url: "http://keycloak:8080"
