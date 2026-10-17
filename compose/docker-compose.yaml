@@ -1,0 +1,110 @@
+name: mahdi-secure-platform
+
+networks:
+  proxy-tier:
+    driver: bridge
+  app-tier:
+    driver: bridge
+  data-tier:
+    driver: bridge
+    internal: true
+
+volumes:
+  pg_data_mahdi:
+
+services:
+  # 1. Protection du Socket Docker (Filtre API)
+  docker-proxy:
+    image: ghcr.io/tecnativa/docker-socket-proxy:v0.4.2
+    container_name: mdp-docker-proxy
+    restart: on-failure:3
+    environment:
+      CONTAINERS: 1
+      INFO: 1
+      VERSION: 1
+      AUTH: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - proxy-tier
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # 2. Reverse Proxy (Traefik)
+  reverse-proxy:
+    image: traefik:v3.3
+    container_name: mdp-traefik
+    restart: on-failure:3
+    command:
+      - "--api.insecure=false"
+      - "--providers.docker=true"
+      - "--providers.docker.endpoint=tcp://docker-proxy:2375"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entryPoints.web.address=:80"
+      - "--entryPoints.websecure.address=:443"
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - proxy-tier
+      - app-tier
+    depends_on:
+      - docker-proxy
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # 3. Base de données (PostgreSQL)
+  database:
+    image: postgres:17-alpine
+    container_name: mdp-postgres
+    restart: on-failure:3
+    env_file:
+      - .env
+    volumes:
+      - pg_data_mahdi:/var/lib/postgresql/data
+    networks:
+      - data-tier
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # 4. Serveur d'authentification (Keycloak)
+  sso-auth:
+    image: quay.io/keycloak/keycloak:26.4
+    container_name: mdp-keycloak
+    restart: on-failure:3
+    command: start-dev --http-enabled=true
+    env_file:
+      - .env
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://database:5432/keycloak_db
+      KC_PROXY_HEADERS: xforwarded
+    networks:
+      - app-tier
+      - data-tier
+    depends_on:
+      database:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 1G
