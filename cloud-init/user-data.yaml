@@ -22,6 +22,7 @@ users:
       -  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPbYsFtZ2uBD4F9tUQxirK3TDgwjdl4m36rPL4LmSVoe jires
       -  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMOGp8S05dB0TeFQYkC5A6h27h0av1s+7/6oxRIpEODM rubeni
       -  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICY2fTT3IoxTawxEXU5kCYTOIq7NRioZlajfYnM2DPwk MahdiBou
+      -  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIV9lygWYFajCQ9l0Pm650jMzuPaNjj2N9VQrTyCnmlv kenga
 
 runcmd:
   - install -m 0755 -d /etc/apt/keyrings
