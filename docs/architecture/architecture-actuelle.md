@@ -74,3 +74,25 @@ Le socket proxy sert d'intermédiaire entre Traefik et le Docker socket. Traefik
 
 **socket-net**
 `socket-net` est un réseau Docker interne réservé à la communication entre Traefik et le socket proxy. Il est configuré avec `internal: true`. Traefik est connecté à la fois à `frontend-net`, pour le côté exposition, et à `socket-net`, uniquement pour communiquer avec le socket proxy. Cette séparation évite de placer le socket proxy sur le réseau d'exposition et limite ainsi son accessibilité aux composants qui en ont besoin.
+
+
+
+## Schémas d'architecture du projet
+
+Pour faciliter la compréhension du projet et permettre aux membres du groupe de suivre son évolution, deux schémas complémentaires ont été préparés.
+
+### Figure 1 — Architecture cible complète
+
+Cette figure présente l'architecture que nous souhaitons mettre en place conformément à l'énoncé du travail de session. Elle montre les composants prévus, les différents réseaux Docker et les communications entre les services.
+
+![Figure 1 — Architecture cible complète de la plateforme](architecture-cible.png)
+
+### Figure 2 — État actuel du déploiement au 20 octobre 2026
+
+Cette figure présente l'état d'avancement du projet au 20 octobre 2026. Elle distingue les composants déjà configurés et testés de ceux qui restent à déployer.
+
+À cette date, Traefik, HTTPS et socket-proxy fonctionnent dans notre VM Ubuntu. Les réseaux `frontend-net` et `socket-net` existent. Les réseaux applicatif et de données ainsi que les services Drupal Commerce, Moodle, Keycloak, n8n et PostgreSQL restent à mettre en place.
+
+![Figure 2 — État actuel du déploiement](etat-actuel-deploiement.png)
+
+**Remarque :** ces schémas représentent respectivement l'architecture cible et l'état du déploiement à une date précise. Ils devront être actualisés au fur et à mesure de l'avancement du projet.
