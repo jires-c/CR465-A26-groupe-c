@@ -18,3 +18,6 @@
 # Fichiers temporaires du système
 .DS_Store
 Thumbs.db
+# Copies locales de verification du Compose
+/compose/compose-ubuntu-verification.yaml
+/compose/compose-avant-postgresql.bak
