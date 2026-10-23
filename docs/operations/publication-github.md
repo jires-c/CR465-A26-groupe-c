@@ -379,3 +379,22 @@ Les fichiers prévus pour la publication sont :
 Les documents `docs/operations/connexion-ssh.md`, `docs/operations/demarrage-vm-qemu.md` et `docs/operations/publication-github.md` devront également être pris en compte.
 Avant le commit, vérifier les fichiers modifiés, les informations sensibles, la zone de préparation Git et l'état de la branche distante.
 Ne pas utiliser git add . ni git push --force.
+
+## 11. Publication effective sur GitHub
+
+Date : 23 octobre 2026
+Branche : rolande
+Commit : 8541d05
+
+Les sept fichiers prepares ont ete enregistres dans un commit local, puis publies sur GitHub avec les commandes suivantes :
+
+```powershell
+git commit -m "Ajout PostgreSQL, segmentation reseau et documentation technique"
+git push origin rolande
+```
+
+Le push a reussi vers le depot CR465-A26-groupe-c sur la branche rolande.
+
+La verification finale avec git status -sb a confirme la synchronisation entre rolande et origin/rolande, sans modification locale restante.
+
+La publication sur la branche rolande est terminee. Aucune fusion avec la branche principale du projet n a ete effectuee.
