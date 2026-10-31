@@ -1,0 +1,115 @@
+#cloud-config
+# Multipass Ubuntu 24.04 LTS - Docker Engine + Compose en mode rootless
+# Provisionnement complet et automatique du moteur Docker sous ubuntu (non-root).
+package_update: true
+package_upgrade: true
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - jq
+  - uidmap
+  - dbus-user-session
+  - slirp4netns
+  - fuse-overlayfs
+  - ufw
+write_files:
+  - path: /usr/local/sbin/prepare-docker-rootless.sh
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+      chmod a+r /etc/apt/keyrings/docker.asc
+      cat > /etc/apt/sources.list.d/docker.sources <<SOURCES
+      Types: deb
+      URIs: https://download.docker.com/linux/ubuntu
+      Suites: noble
+      Components: stable
+      Architectures: $(dpkg --print-architecture)
+      Signed-By: /etc/apt/keyrings/docker.asc
+      SOURCES
+      apt-get update
+      apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras
+      # Le moteur privilegie ne doit pas tourner en parallele dans cette VM de test.
+      systemctl disable --now docker.service docker.socket
+      rm -f /run/docker.sock
+      # Pare-feu hote. Les ports applicatifs seront ouverts apres validation du besoin.
+      ufw allow 22/tcp
+      ufw --force enable
+  - path: /usr/local/sbin/activate-docker-rootless.sh
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      # Ce script est lance par cloud-init (root), mais le setup Docker doit
+      # lui-meme etre execute sous l'utilisateur ubuntu, sans privileges root.
+      DOCKER_USER=ubuntu
+      USER_ID="$(id -u "$DOCKER_USER")"
+      RUNTIME_DIR="/run/user/${USER_ID}"
+      BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
+
+      # Prerequis des espaces de noms utilisateur : au moins 65536 UID/GID.
+      for file in /etc/subuid /etc/subgid; do
+        if ! awk -F: '$1 == "ubuntu" && $3 >= 65536 {ok=1} END{exit !ok}' "$file"; then
+          echo "ERREUR : plage UID/GID manquante ou trop courte dans $file" >&2
+          exit 1
+        fi
+      done
+
+      # Demarrer et conserver le gestionnaire systemd de l'utilisateur ubuntu.
+      loginctl enable-linger "$DOCKER_USER"
+      systemctl start "user@${USER_ID}.service"
+
+      # La session systemd utilisateur doit disposer de son bus D-Bus.
+      for i in $(seq 1 30); do
+        [ -S "${RUNTIME_DIR}/bus" ] && break
+        sleep 1
+      done
+      if [ ! -S "${RUNTIME_DIR}/bus" ]; then
+        echo "ERREUR : bus systemd utilisateur indisponible" >&2
+        exit 1
+      fi
+
+      # Executer dans le vrai contexte systemd de l'utilisateur non-root.
+      user_cmd() {
+        runuser -u "$DOCKER_USER" -- env \
+          HOME="/home/${DOCKER_USER}" \
+          USER="$DOCKER_USER" LOGNAME="$DOCKER_USER" \
+          XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+          DBUS_SESSION_BUS_ADDRESS="$BUS_ADDRESS" \
+          PATH="/usr/local/bin:/usr/bin:/bin" \
+          "$@"
+      }
+
+      # Installation du daemon et du contexte CLI rootless.
+      user_cmd dockerd-rootless-setuptool.sh install
+      user_cmd systemctl --user enable --now docker.service
+      user_cmd docker context use rootless
+
+      # Attendre que le daemon rootless soit pret et verifier son etat.
+      verified=no
+      for i in $(seq 1 20); do
+        if user_cmd docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -q rootless; then
+          verified=yes
+          break
+        fi
+        sleep 2
+      done
+      if [ "$verified" != yes ]; then
+        echo "ERREUR : le daemon Docker ne repond pas en mode rootless" >&2
+        user_cmd systemctl --user --no-pager status docker.service || true
+        exit 1
+      fi
+      echo "SUCCES : moteur Docker Rootless actif pour ubuntu"
+      user_cmd docker context show
+      user_cmd docker info --format '{{json .SecurityOptions}}'
+runcmd:
+  - [bash, /usr/local/sbin/prepare-docker-rootless.sh]
+  - [bash, /usr/local/sbin/activate-docker-rootless.sh]
+final_message: "Cloud-init termine. Verifier Docker Rootless avec: docker info"
