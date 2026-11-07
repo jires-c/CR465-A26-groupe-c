@@ -1,1 +1,10 @@
-qemu-system-x86_64   -name cr465-vm   -enable-kvm   -cpu host   -m 4G   -smp 2   -drive file=$HOME/images/cr465-vm.qcow2,format=qcow2,if=virtio   -drive file=$HOME/CR465/cloud-init/seed.iso,format=raw,if=virtio   -nic user,model=virtio-net-pci,hostfwd=tcp::2222-:22   -nographic
+qemu-system-x86_64 \
+  -name cr465-vm \
+  -enable-kvm \
+  -cpu host \
+  -m 4G \
+  -smp 2 \
+  -drive file=$HOME/images/cr465-vm.qcow2,format=qcow2,if=virtio \
+  -drive file=$HOME/CR465/cloud-init/seed.iso,format=raw,if=virtio \
+  -nic user,model=virtio-net-pci,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:80,hostfwd=tcp::8443-:443 \
+  -nographic
