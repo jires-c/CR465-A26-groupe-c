@@ -1,0 +1,654 @@
+#cloud-config
+# ============================================================================
+# MODE D'EMPLOI : cloud-init, le fichier qui construit la VM automatiquement
+# ============================================================================
+# 1) package_update/package_upgrade : met Ubuntu a jour.
+# 2) packages : installe les petits outils requis par nos scripts.
+# 3) write_files : cloud-init ecrit les fichiers (YAML, Bash, README) dans /opt
+#    et /usr/local/sbin. ATTENTION: write_files N'EXECUTE PAS ces fichiers.
+# 4) runcmd : execute nos trois scripts a la creation de la VM, dans cet ordre :
+#    installation de Docker, activation du mode rootless, demarrage des services.
+# 5) final_message : affiche une indication a la fin du provisionnement.
+#
+# Ce fichier est une base LABORATOIRE, pas une configuration exposee en public :
+# - Traefik n'ecoute que sur le localhost de la VM, en HTTP sans TLS.
+# - Le test Nginx est temporaire et non expose directement.
+# - PostgreSQL n'expose pas son port sur l'hote.
+# - Les secrets sont generes sur la VM, jamais ecrits dans ce code.
+# - Moodle/Drupal/Keycloak/n8n ne sont pas installes ici ; leurs bases le sont.
+# - Il faut TESTER le lancement dans une VM neuve avant de publier comme valide.
+# ============================================================================
+# Projet CR465 - Infrastructure de base VM as Code
+# Ubuntu 24.04 LTS sur Multipass - Docker Engine Rootless + Docker Compose
+# Traefik + PostgreSQL 17 + test Nginx - AUTOMATISATION COMPLETE AU 1ER BOOT
+# Ce fichier est concu pour une VM NEUVE, PAS pour modifier rootless-auto.
+# Aucun secret n'est embarque dans ce fichier (partageable sur GitHub).
+# ATTENTION: Traefik est limite a localhost/HTTP; config de labo, non publique.
+
+# Actualise les listes APT avant installation des paquets.
+package_update: true
+# Met a jour les paquets deja installes. Cela peut augmenter la duree du premier boot.
+package_upgrade: true
+# Dependances systeme. cloud-init les installe avant les commandes runcmd.
+packages:
+  # Autorites de certification pour verifier les connexions HTTPS.
+  - ca-certificates
+  # Telecharge des ressources HTTPS et effectue les tests HTTP.
+  - curl
+  # Permet le travail avec les depots GitHub.
+  - git
+  # Analyse du JSON en ligne de commande (outil utile au diagnostic).
+  - jq
+  # newuidmap/newgidmap requis pour mapper les UID/GID Rootless.
+  - uidmap
+  # Bus D-Bus pour le service systemd de ubuntu.
+  - dbus-user-session
+  # Reseau utilisateur sans privileges root pour les conteneurs.
+  - slirp4netns
+  # Mecanisme de stockage overlay utilisable en environnement rootless.
+  - fuse-overlayfs
+  # Pare-feu de l hote Ubuntu.
+  - ufw
+  # Genere les mots de passe aleatoires des bases.
+  - openssl
+
+# ==============================================================
+# WRITE_FILES : cloud-init cree tout ce qui suit automatiquement
+# ==============================================================
+# Tous ces fichiers sont ecrits sur la VM AVANT les trois scripts runcmd.
+# "owner: root:root" signifie proprietaire root ; "0755" executable, "0644" lecture.
+# Les fichiers sont crees sur l hote, non directement dans un conteneur.
+write_files:
+  # Script systeme 1 : installe Docker depuis le depot officiel et evite le daemon privilegie.
+  - path: /usr/local/sbin/prepare-docker-rootless.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      # EXPLICATION : Mode Bash strict : -e stoppe sur erreur, -u refuse les variables absentes, pipefail detecte les echecs dans les pipelines.
+      set -euo pipefail
+      # EXPLICATION : Evite qu apt affiche une question interactive lors de l installation automatisee.
+      export DEBIAN_FRONTEND=noninteractive
+
+      # Installer le moteur Docker et le plugin Compose depuis le depot officiel.
+      # EXPLICATION : Cree le repertoire des cles APT avec des permissions de lecture standard (0755).
+      install -m 0755 -d /etc/apt/keyrings
+      # EXPLICATION : Recupere la cle GPG du depot officiel Docker pour verifier les paquets.
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+      # EXPLICATION : Donne aux processus APT le droit de lire cette cle.
+      chmod a+r /etc/apt/keyrings/docker.asc
+      # EXPLICATION : Ecrit le fichier de depot APT Docker. SOURCES termine le bloc multilignes Bash.
+      cat > /etc/apt/sources.list.d/docker.sources <<SOURCES
+      Types: deb
+      URIs: https://download.docker.com/linux/ubuntu
+      Suites: noble
+      Components: stable
+      Architectures: $(dpkg --print-architecture)
+      Signed-By: /etc/apt/keyrings/docker.asc
+      SOURCES
+      # EXPLICATION : Recharge les listes des paquets maintenant que le depot Docker a ete ajoute.
+      apt-get update
+      # EXPLICATION : Installe le moteur Docker, son client CLI, containerd, Buildx, Compose et les outils Rootless. -y confirme automatiquement.
+      apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras
+
+      # Eviter tout demon Docker privilegie en parallele.
+      # EXPLICATION : Desactive et arrete le daemon et le socket Docker privilegies ; le daemon utilisateur sera installe ensuite.
+      systemctl disable --now docker.service docker.socket
+      # EXPLICATION : Supprime un eventuel socket systeme residuel (-f ignore son absence), sans toucher au futur socket Rootless.
+      rm -f /run/docker.sock
+
+      # Garder SSH autorise sur la VM laboratoire, aucun port applicatif public.
+      # EXPLICATION : Prevoit une exception SSH TCP/22 avant d activer le pare-feu pour eviter de bloquer cette administration.
+      ufw allow 22/tcp
+      # EXPLICATION : Active UFW sans demander confirmation ; les ports applicatifs ne sont pas ouverts ici.
+      ufw --force enable
+
+  # Script systeme 2 : configure le demon Docker NON root pour le compte ubuntu.
+  - path: /usr/local/sbin/activate-docker-rootless.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      # EXPLICATION : Stoppe les erreurs plutot que de continuer avec une installation partiellement validee.
+      set -euo pipefail
+
+      # Reprend la procedure rootless deja validee dans le projet.
+      # EXPLICATION : Compte Linux NON root qui possedera et executera le moteur Docker.
+      DOCKER_USER=ubuntu
+      # EXPLICATION : Calcule son UID numerique (habituellement 1000, sans supposer que cette valeur est fixe).
+      USER_ID="$(id -u "$DOCKER_USER")"
+      # EXPLICATION : Repertoire runtime systemd de cet utilisateur ; contient le socket du daemon Rootless.
+      RUNTIME_DIR="/run/user/${USER_ID}"
+      # EXPLICATION : Adresse D-Bus utilisee pour communiquer avec le gestionnaire systemd de l utilisateur.
+      BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
+
+      # Docker Rootless requiert au moins 65536 UID/GID subordonnes.
+      # EXPLICATION : Verifie les plages d identifiants utilisateurs et groupes subordonnes requises par les user namespaces Rootless.
+      for file in /etc/subuid /etc/subgid; do
+        # EXPLICATION : awk lit les champs separes par deux-points et exige >=65536 UID/GID subordonnes pour ubuntu.
+        if ! awk -F: '$1 == "ubuntu" && $3 >= 65536 {ok=1} END{exit !ok}' "$file"; then
+          echo "ERREUR: plage UID/GID insuffisante dans $file" >&2
+          exit 1
+        fi
+      done
+
+      # EXPLICATION : Conserve le gestionnaire systemd de ubuntu actif meme lorsqu aucune session SSH n est ouverte.
+      loginctl enable-linger "$DOCKER_USER"
+      # EXPLICATION : Lance le gestionnaire systemd --user associe a cet UID.
+      systemctl start "user@${USER_ID}.service"
+      # EXPLICATION : Attend au plus 30 iterations la creation du bus D-Bus utilisateur, plutot que de supposer un demarrage instantane.
+      for i in $(seq 1 30); do
+        [ -S "${RUNTIME_DIR}/bus" ] && break
+        sleep 1
+      done
+      # EXPLICATION : Verifie que le chemin est bien un socket (-S) ; arrete si le bus n est jamais apparu.
+      [ -S "${RUNTIME_DIR}/bus" ] || { echo 'ERREUR: bus systemd absent' >&2; exit 1; }
+
+      # EXPLICATION : Fonction reutilisable : execute une commande comme ubuntu, avec HOME, variables systemd et PATH corrects.
+      user_cmd() {
+        runuser -u "$DOCKER_USER" -- env \
+          HOME="/home/${DOCKER_USER}" USER="$DOCKER_USER" LOGNAME="$DOCKER_USER" \
+          XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+          DBUS_SESSION_BUS_ADDRESS="$BUS_ADDRESS" \
+          PATH="/usr/local/bin:/usr/bin:/bin" "$@"
+      }
+
+      # EXPLICATION : Installe et configure le service Docker Rootless pour ubuntu, PAS pour root.
+      user_cmd dockerd-rootless-setuptool.sh install
+      # EXPLICATION : Active Docker au demarrage du gestionnaire utilisateur et le lance immediatement.
+      user_cmd systemctl --user enable --now docker.service
+      # EXPLICATION : Selectionne le contexte Docker CLI pointant vers le daemon Rootless.
+      user_cmd docker context use rootless
+
+      # EXPLICATION : Drapeau de verification ; reste "no" jusqu a ce que le daemon confirme le mode rootless.
+      verified=no
+      # EXPLICATION : Attend au plus 30 iterations la creation du bus D-Bus utilisateur, plutot que de supposer un demarrage instantane.
+      for i in $(seq 1 30); do
+        # EXPLICATION : Interroge les options de securite de Docker ; grep recherche "rootless". stderr est masque pendant l attente.
+        if user_cmd docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -q rootless; then
+          verified=yes
+          break
+        fi
+        sleep 2
+      done
+      # EXPLICATION : Refuse de poursuivre l installation si le daemon n a pas ete valide.
+      [ "$verified" = yes ] || { echo 'ERREUR: Docker Rootless non operationnel' >&2; exit 1; }
+      echo 'SUCCES: Docker Rootless installe et actif sous ubuntu'
+      # EXPLICATION : Affiche les options finales comme preuve technique dans les journaux cloud-init.
+      user_cmd docker info --format '{{json .SecurityOptions}}'
+
+  # Fichier Compose du reverse proxy Traefik (pas encore d HTTPS).
+  - path: /opt/traefik/docker-compose.yml
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # EXPLICATION : Nom du projet Compose, pour identifier ses ressources et le separer des autres Compose.
+      name: plateforme-traefik
+      # EXPLICATION : Debut des services definis dans CE fichier Compose.
+      services:
+        # EXPLICATION : Nom du service du reverse proxy ; Compose creera son conteneur.
+        traefik:
+          # EXPLICATION : Image Traefik version majeure 3.5. Pour la production, figer davantage la version ou un digest.
+          image: traefik:v3.5
+          # EXPLICATION : Docker relance automatiquement le service apres un redemarrage, sauf arret volontaire.
+          restart: unless-stopped
+          # EXPLICATION : Options de renforcement du conteneur.
+          security_opt:
+            # EXPLICATION : Empeche un processus de gagner de nouveaux privileges via exec.
+            - no-new-privileges:true
+          # EXPLICATION : Monte le systeme de fichiers du conteneur en lecture seule ; les montages declares restent distincts.
+          read_only: true
+          # EXPLICATION : Prevoit de la memoire temporaire ecrivable sans persistance sur le disque.
+          tmpfs:
+            # EXPLICATION : Autorise Traefik a utiliser /tmp pour ses fichiers temporaires.
+            - /tmp
+          # EXPLICATION : Arguments donnes au programme Traefik lors de son demarrage.
+          command:
+            # EXPLICATION : Cree un point d entree HTTP nomme web, sur le port 8080 A L INTERIEUR du conteneur.
+            - "--entrypoints.web.address=:8080"
+            # EXPLICATION : Active le point de controle de sante /ping.
+            - "--ping=true"
+            # EXPLICATION : Attache /ping au point d entree web : on peut le tester sur le port 8080.
+            - "--ping.entrypoint=web"
+            # EXPLICATION : Charge les routes HTTP depuis un fichier, sans exposer le socket Docker au proxy.
+            - "--providers.file.filename=/etc/traefik/dynamic.yaml"
+            # EXPLICATION : Surveille les modifications du fichier dynamique et recharge les routes si possible.
+            - "--providers.file.watch=true"
+            # EXPLICATION : Desactive le tableau de bord Traefik pour cette base de laboratoire.
+            - "--api.dashboard=false"
+          # LABORATOIRE: visible seulement depuis la VM; pas encore de HTTPS.
+          # EXPLICATION : Seuls les services ayant "ports" publient un port sur l hote.
+          ports:
+            # EXPLICATION : Lie le port 8080 de la VM a celui de Traefik, UNIQUEMENT sur le localhost de la VM.
+            - "127.0.0.1:8080:8080"
+          # EXPLICATION : Montages de fichiers entre la VM et le conteneur.
+          volumes:
+            # EXPLICATION : Montage du fichier de routes en lecture seule (:ro) dans Traefik.
+            - /opt/traefik/dynamic.yaml:/etc/traefik/dynamic.yaml:ro
+          # EXPLICATION : Traefik rejoint les deux reseaux : exposition et applicatif ; jamais celui des donnees.
+          networks:
+            # EXPLICATION : Reseau de la zone d entree Traefik.
+            - exposition
+            # EXPLICATION : Reseau permettant a Traefik de joindre les applications telles que webtest.
+            - applicatif
+
+      # EXPLICATION : Traefik rejoint les deux reseaux : exposition et applicatif ; jamais celui des donnees.
+      networks:
+        exposition:
+          # EXPLICATION : Le reseau existe DEJA et est gere en dehors de ce Compose par deploy.sh.
+          external: true
+          # EXPLICATION : Vrai nom Docker du reseau partage avec les autres projets.
+          name: plateforme-exposition
+        applicatif:
+          # EXPLICATION : Le reseau existe DEJA et est gere en dehors de ce Compose par deploy.sh.
+          external: true
+          # EXPLICATION : Vrai nom Docker du reseau partage avec les autres services.
+          name: plateforme-applicatif
+
+  # Routes HTTP lues directement par Traefik (provider fichier).
+  - path: /opt/traefik/dynamic.yaml
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # Traefik utilise le provider FILE: aucun montage du socket Docker.
+      # Les futures routes moodle/drupal/keycloak seront ajoutees ici.
+      # EXPLICATION : Debut de la configuration du routage HTTP dans le provider fichier de Traefik.
+      http:
+        # EXPLICATION : Les routers examinent les requetes entrantes et choisissent un service selon les regles.
+        routers:
+          # EXPLICATION : Nom du routeur de demonstration ; sera complete par Moodle/Drupal/Keycloak.
+          webtest:
+            # EXPLICATION : La regle fait correspondre seulement les requetes portant le Host HTTP demo.localhost.
+            rule: "Host(`demo.localhost`)"
+            # EXPLICATION : Liste des points d entree autorises pour ce routeur.
+            entryPoints:
+              # EXPLICATION : Utilise le point d entree "web" defini sur le port 8080 dans Traefik.
+              - web
+            # EXPLICATION : Envoie une requete correspondante vers le service interne webtest ci-dessous.
+            service: webtest
+        # EXPLICATION : Definit les destinations finales possibles pour les routers.
+        services:
+          # EXPLICATION : Nom du routeur de demonstration ; sera complete par Moodle/Drupal/Keycloak.
+          webtest:
+            # EXPLICATION : Traefik utilise un service de repartition de charge (ici une seule destination).
+            loadBalancer:
+              # EXPLICATION : Liste des serveurs backend disponibles pour ce service.
+              servers:
+                # EXPLICATION : Docker DNS resout webtest sur le reseau partage ; Nginx ecoute en HTTP au port interne 80.
+                - url: "http://webtest:80"
+
+  # Serveur Nginx provisoire pour tester Traefik sans attendre Moodle/Drupal.
+  - path: /opt/webtest/docker-compose.yml
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # Service TEMPORAIRE pour prouver le routage de Traefik.
+      # Supprimable lorsque les vraies applications sont disponibles.
+      # EXPLICATION : Projet de demonstration Nginx, distinct du projet Traefik.
+      name: plateforme-webtest
+      # EXPLICATION : Contient le service HTTP temporaire utilise pour valider le reverse proxy.
+      services:
+        # EXPLICATION : Nom DNS Docker webtest, utilise dans l URL definie par Traefik.
+        webtest:
+          # EXPLICATION : Image Nginx legere basee sur Alpine Linux (version 1.28).
+          image: nginx:1.28-alpine
+          # EXPLICATION : Redemarre automatiquement Nginx avec Docker tant qu il n est pas arrete volontairement.
+          restart: unless-stopped
+          # EXPLICATION : Applique des protections supplementaires au processus du conteneur.
+          security_opt:
+            # EXPLICATION : Empeche le gain de nouveaux privileges pour les processus Nginx.
+            - no-new-privileges:true
+          # Aucun "ports": uniquement accessible via le reseau applicatif.
+          # EXPLICATION : Le service Nginx n est attache qu au reseau applicatif, pas aux donnees.
+          networks:
+            # EXPLICATION : Traefik et Nginx partagent ce reseau pour pouvoir communiquer.
+            - applicatif
+
+      # EXPLICATION : Le service Nginx n est attache qu au reseau applicatif, pas aux donnees.
+      networks:
+        applicatif:
+          # EXPLICATION : Compose reutilise un reseau cree ailleurs au lieu de creer son propre reseau prive.
+          external: true
+          # EXPLICATION : Nom exact du reseau cree par le script de deploiement.
+          name: plateforme-applicatif
+
+  # Fichier Compose PostgreSQL, sa persistance, ses secrets et son reseau interne.
+  - path: /opt/postgresql/docker-compose.yml
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # EXPLICATION : Projet Compose separe, dedie a la couche de donnees PostgreSQL.
+      name: plateforme-postgresql
+      # EXPLICATION : Liste des conteneurs de ce fichier : ici un seul serveur PostgreSQL.
+      services:
+        # EXPLICATION : Nom du service : les applications sur le reseau donnees utiliseront "postgres" comme hote.
+        postgres:
+          # EXPLICATION : Image PostgreSQL version 17 ; les mises a jour mineures peuvent changer avec ce tag.
+          image: postgres:17
+          # EXPLICATION : Relance PostgreSQL au redemarrage, sauf si on l a arrete volontairement.
+          restart: unless-stopped
+          # EXPLICATION : Variables lues par le script de demarrage de l image officielle PostgreSQL.
+          environment:
+            # EXPLICATION : Cree le superutilisateur PostgreSQL initial nomme postgres.
+            POSTGRES_USER: postgres
+            # EXPLICATION : Cree/selectionne la base initiale postgres.
+            POSTGRES_DB: postgres
+            # EXPLICATION : Lit le mot de passe administrateur depuis un fichier secret, pas depuis une valeur dans le YAML.
+            POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
+            # EXPLICATION : Demande SCRAM-SHA-256 pour les connexions TCP initiales de PostgreSQL.
+            POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+          # Aucun port publie : connexion seulement via le reseau Docker donnees.
+          # EXPLICATION : Persiste les donnees et monte le script d initialisation dans le conteneur.
+          volumes:
+            # EXPLICATION : Volume Docker nomme : les donnees restent apres recreation du conteneur (sans "down -v").
+            - postgres_data:/var/lib/postgresql/data
+            # EXPLICATION : Script execute automatiquement par l image officielle si le volume de donnees est vide.
+            - /opt/postgresql/initdb/01-init-databases.sh:/docker-entrypoint-initdb.d/01-init-databases.sh:ro
+          # EXPLICATION : Liste des secrets accessibles a CE conteneur PostgreSQL.
+          secrets:
+            # EXPLICATION : Mot de passe administrateur, lu au demarrage par POSTGRES_PASSWORD_FILE.
+            - postgres_admin_password
+            # EXPLICATION : Mot de passe du role Moodle, utilise par le script initdb.
+            - moodle_db_password
+            # EXPLICATION : Mot de passe du role Keycloak, utilise par le script initdb.
+            - keycloak_db_password
+            # EXPLICATION : Mot de passe du role Drupal, utilise par le script initdb.
+            - drupal_db_password
+            # EXPLICATION : Mot de passe du role n8n, utilise par le script initdb.
+            - n8n_db_password
+          # EXPLICATION : PostgreSQL rejoint UNIQUEMENT le reseau de donnees.
+          networks:
+            # EXPLICATION : Pas de liaison reseau directe avec Traefik ; seules les applications autorisees rejoindront donnees.
+            - donnees
+          # EXPLICATION : Verification recurrente pour savoir si PostgreSQL accepte des connexions.
+          healthcheck:
+            # EXPLICATION : pg_isready teste si PostgreSQL est pret ; ne verifie pas toutes les applications ni leurs schemas.
+            test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+            # EXPLICATION : Lance le healthcheck toutes les 5 secondes.
+            interval: 5s
+            # EXPLICATION : Un essai expire apres 3 secondes.
+            timeout: 3s
+            # EXPLICATION : Apres 30 echecs consecutifs, Docker peut declarer le conteneur unhealthy.
+            retries: 30
+            # EXPLICATION : Accorde un delai initial de 20 secondes avant de compter les echecs.
+            start_period: 20s
+
+      # EXPLICATION : Persiste les donnees et monte le script d initialisation dans le conteneur.
+      volumes:
+        # EXPLICATION : Declare le volume nomme que Docker gere pour conserver les fichiers de la base.
+        postgres_data:
+
+      # EXPLICATION : Liste des secrets accessibles a CE conteneur PostgreSQL.
+      secrets:
+        # Les valeurs sont generees a la creation de la VM, jamais dans ce YAML.
+        # EXPLICATION : Reference le fichier de secret administrateur genere sur la VM.
+        postgres_admin_password:
+          file: /opt/plateforme/secrets/postgres_admin_password
+        # EXPLICATION : Reference le fichier du secret Moodle.
+        moodle_db_password:
+          file: /opt/plateforme/secrets/moodle_db_password
+        # EXPLICATION : Reference le fichier du secret Keycloak.
+        keycloak_db_password:
+          file: /opt/plateforme/secrets/keycloak_db_password
+        # EXPLICATION : Reference le fichier du secret Drupal.
+        drupal_db_password:
+          file: /opt/plateforme/secrets/drupal_db_password
+        # EXPLICATION : Reference le fichier du secret n8n.
+        n8n_db_password:
+          file: /opt/plateforme/secrets/n8n_db_password
+
+      # EXPLICATION : PostgreSQL rejoint UNIQUEMENT le reseau de donnees.
+      networks:
+        donnees:
+          # EXPLICATION : Compose ne cree pas ce reseau : il reutilise plateforme-donnees deja cree par deploy.sh.
+          external: true
+          # EXPLICATION : Nom commun de la zone de donnees, avec option Docker --internal.
+          name: plateforme-donnees
+
+  # Script d initialisation SQL execute par l image PostgreSQL au premier demarrage de la BD.
+  - path: /opt/postgresql/initdb/01-init-databases.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      # EXPLICATION : Arrete le script d initialisation si une commande, variable ou pipeline echoue.
+      set -euo pipefail
+
+      # Lance par le point d'entree de postgres:17 UNIQUEMENT sur volume vide.
+      # Secrets generes sur la VM et montes dans /run/secrets; pas dans GitHub.
+      # Noms de bases/roles fixes et mots de passe aleatoires hexadecimaux.
+      # EXPLICATION : Repete la preparation pour les 4 applications necessitant une base et un role differents.
+      for app in moodle keycloak drupal n8n; do
+        # EXPLICATION : Lit le secret de l application dans le conteneur. La variable Bash ne sera pas imprimee.
+        password="$(cat "/run/secrets/${app}_db_password")"
+        # EXPLICATION : Controle que le secret est une chaine hexadecimale de 64 caracteres (32 octets aleatoires).
+        [[ "$password" =~ ^[0-9a-f]{64}$ ]] || { echo "Mot de passe invalide pour $app" >&2; exit 1; }
+
+        # \gexec execute les instructions SQL produites par SELECT sans
+        # ajouter de bloc DO ni de transaction autour de CREATE DATABASE.
+        # EXPLICATION : Ouvre psql; -X ignore les reglages utilisateur, -q est discret, ON_ERROR_STOP arrete sur SQL invalide. <<SQL commence le SQL.
+        psql -X -q -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres <<SQL
+      SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', '${app}', '${password}')
+      WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='${app}')
+      \gexec
+      SELECT format('CREATE DATABASE %I OWNER %I', '${app}', '${app}')
+      WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname='${app}')
+      \gexec
+      SQL
+        # EXPLICATION : Efface la variable temporaire de mot de passe apres creation du role.
+        unset password
+        # EXPLICATION : Affiche seulement le nom de l application dans les journaux, jamais son mot de passe.
+        echo "Base et role prets: ${app}"
+      done
+
+  # Script systeme 3 : lance les conteneurs comme ubuntu et les controle.
+  - path: /opt/plateforme/deploy.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      # EXPLICATION : Stoppe le deploiement en cas d erreur et evite d annoncer un succes partiel.
+      set -euo pipefail
+      # EXPLICATION : Compte non privilegie qui execute tous les appels Docker.
+      DOCKER_USER=ubuntu
+      # EXPLICATION : Determine l UID pour construire correctement les chemins runtime.
+      USER_ID="$(id -u "$DOCKER_USER")"
+      # EXPLICATION : Emplacement du socket Docker Rootless pour cet utilisateur.
+      RUNTIME_DIR="/run/user/${USER_ID}"
+      # EXPLICATION : Adresse D-Bus du gestionnaire systemd de ubuntu.
+      BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
+
+      # EXPLICATION : Fonction qui force toutes les commandes Docker a passer par le contexte de ubuntu et son daemon Rootless.
+      user_docker() {
+        runuser -u "$DOCKER_USER" -- env \
+          HOME="/home/${DOCKER_USER}" USER="$DOCKER_USER" LOGNAME="$DOCKER_USER" \
+          XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+          DBUS_SESSION_BUS_ADDRESS="$BUS_ADDRESS" \
+          DOCKER_HOST="unix://${RUNTIME_DIR}/docker.sock" \
+          PATH="/usr/local/bin:/usr/bin:/bin" docker "$@"
+      }
+
+      # EXPLICATION : Verification de securite bloquante : si Docker n est pas Rootless, pas de deploiement.
+      user_docker info --format '{{json .SecurityOptions}}' | grep -q rootless || {
+        echo 'ERREUR: moteur Docker non-rootless' >&2; exit 1;
+      }
+
+      # Repertoires projets sous /opt ; les collegues ajouteront leurs Compose.
+      # EXPLICATION : Cree les repertoires /opt de la base et reserve ceux des futurs projets de vos collegues.
+      for folder in traefik postgresql webtest moodle drupal keycloak n8n portainer; do
+        # EXPLICATION : Cree le dossier s il manque ; 0755 permet la lecture et l acces, mais pas l ecriture a tous.
+        install -d -m 0755 "/opt/${folder}"
+      done
+      # EXPLICATION : Donne a ubuntu la propriete des repertoires Compose de la base (attention: pas un droit root).
+      chown -R ubuntu:ubuntu /opt/traefik /opt/postgresql /opt/webtest
+
+      # Dossier secret non accessible aux autres utilisateurs de l'hote.
+      # EXPLICATION : Cree le dossier des secrets avec proprietaire ubuntu et droits 0700 (aucun acces aux autres comptes ordinaires).
+      install -d -o ubuntu -g ubuntu -m 0700 /opt/plateforme/secrets
+      # EXPLICATION : Prepare une liste distincte de 5 secrets : administrateur et 4 services applicatifs.
+      for secret in postgres_admin_password moodle_db_password keycloak_db_password drupal_db_password n8n_db_password; do
+        # EXPLICATION : Construit le chemin cible pour chaque secret.
+        file="/opt/plateforme/secrets/${secret}"
+        # EXPLICATION : Genere seulement si le secret est absent/vide ; conserve les mots de passe lors des prochains deploiements.
+        if [ ! -s "$file" ]; then
+          # EXPLICATION : Genere 32 octets aleatoires et les ecrit sous forme de 64 caracteres hexadecimaux.
+          ( umask 077; openssl rand -hex 32 > "$file" )
+        fi
+        # EXPLICATION : Autorise le moteur Docker Rootless de ubuntu a lire le secret local.
+        chown ubuntu:ubuntu "$file"
+        # La lecture par l'UID postgres dans le conteneur requiert un mode lisible.
+        # Sur l'hote, le repertoire parent 0700 protege l'acces a ces fichiers.
+        # EXPLICATION : Fichier lisible, MAIS contenu dans un dossier 0700. Sert a permettre la lecture depuis les montages secrets.
+        chmod 0644 "$file"
+      done
+
+      # Trois reseaux communs entre Compose independants.
+      # EXPLICATION : Prepare les deux reseaux bridges de communication des services exposes et applicatifs.
+      for network in plateforme-exposition plateforme-applicatif; do
+        # EXPLICATION : Teste l existence du reseau sans creer de doublon ; redirige les sorties vers /dev/null.
+        if ! user_docker network inspect "$network" >/dev/null 2>&1; then
+          # EXPLICATION : Cree le reseau bridge sous le daemon Rootless de ubuntu.
+          user_docker network create --driver bridge "$network"
+        fi
+      done
+      # EXPLICATION : Cree la zone donnees seulement si elle n existe pas deja.
+      if ! user_docker network inspect plateforme-donnees >/dev/null 2>&1; then
+        # EXPLICATION : Cree un reseau Docker internal : pas de connectivite externe directe pour cette interface.
+        user_docker network create --driver bridge --internal plateforme-donnees
+      fi
+      # EXPLICATION : Controle que le reseau donnees existant/cree est effectivement marque internal=true.
+      [ "$(user_docker network inspect --format '{{.Internal}}' plateforme-donnees)" = true ] || {
+        echo 'ERREUR: le reseau plateforme-donnees doit etre internal=true' >&2; exit 1;
+      }
+
+      # Verification de la syntaxe Compose avant toute creation de conteneurs.
+      # EXPLICATION : Valide les trois Compose de notre base commune avant de creer les conteneurs.
+      for service in postgresql traefik webtest; do
+        # EXPLICATION : Analyse la configuration Compose, -f selectionne le fichier, --quiet supprime la sortie en cas de succes.
+        user_docker compose -f "/opt/$service/docker-compose.yml" config --quiet
+      done
+
+      # L'ordre PostgreSQL/Traefik est interchangeable; les applications ne
+      # doivent demarrer qu'une fois leur base disponible.
+      # EXPLICATION : Demarre PostgreSQL en arriere-plan (-d) et cree son volume permanent.
+      user_docker compose -f /opt/postgresql/docker-compose.yml up -d
+      # EXPLICATION : Demarre le reverse proxy Traefik et ses deux interfaces Docker.
+      user_docker compose -f /opt/traefik/docker-compose.yml up -d
+      # EXPLICATION : Demarre Nginx pour que Traefik ait une destination testable.
+      user_docker compose -f /opt/webtest/docker-compose.yml up -d
+
+      # Verifier que les quatre bases ont ete creees, et pas juste que le port est ouvert.
+      # EXPLICATION : Drapeau initial de validation des bases, independant du simple demarrage du conteneur.
+      ready=no
+      # EXPLICATION : Jusqu a 90 tentatives pour constater l initialisation SQL, sans delai fixe arbitraire.
+      for i in $(seq 1 90); do
+        # EXPLICATION : Execute une requete dans le conteneur PostgreSQL ; -T desactive le pseudo-terminal (compatible automatisation).
+        count="$(user_docker compose -f /opt/postgresql/docker-compose.yml exec -T postgres \
+          psql -U postgres -d postgres -tAc \
+          "SELECT count(*) FROM pg_database WHERE datname IN ('moodle','keycloak','drupal','n8n')" 2>/dev/null || true)"
+        # EXPLICATION : Le SELECT doit confirmer les quatre noms de bases applicatives.
+        if [ "$count" = 4 ]; then
+          ready=yes
+          break
+        fi
+        sleep 2
+      done
+      # EXPLICATION : Interrompt le provisionnement si l initialisation PostgreSQL ne se termine pas.
+      [ "$ready" = yes ] || { echo 'ERREUR: PostgreSQL ou initialisation des bases' >&2; exit 1; }
+
+      # Le test HTTP passe par Traefik et NON directement par Nginx.
+      # EXPLICATION : Retente les tests HTTP pendant la phase de demarrage de Traefik et Nginx.
+      for i in $(seq 1 30); do
+        # EXPLICATION : Teste /ping et exige la reponse exacte OK avant de valider le proxy.
+        if curl -fsS http://127.0.0.1:8080/ping | grep -qx OK && \
+           curl -fsS -H 'Host: demo.localhost' http://127.0.0.1:8080/ | grep -q 'Welcome to nginx'; then
+          echo 'SUCCES: Docker Rootless, Traefik, Nginx test et PostgreSQL operationnels.'
+          exit 0
+        fi
+        sleep 2
+      done
+      # EXPLICATION : Affiche un message d echec sur stderr si les tests HTTP ne passent jamais.
+      echo 'ERREUR: validation HTTP de Traefik / webtest echouee' >&2
+      # EXPLICATION : Quitte le script avec un code non nul : cloud-init doit remonter un echec.
+      exit 1
+
+  # README cree sur la VM pour expliquer l integration aux autres membres du groupe.
+  - path: /opt/plateforme/README-INTEGRATION.txt
+    owner: root:root
+    permissions: "0644"
+    content: |
+      PLATEFORME CR465 - BASE COMMUNE
+      ================================
+
+      Provisionnement: un seul fichier cloud-init sur une VM Ubuntu 24.04 neuve.
+      Les Compose sont separes par service dans /opt/<service>/docker-compose.yml.
+
+      Services actifs au depart:
+      - Traefik (HTTP seulement sur 127.0.0.1:8080 de la VM)
+      - PostgreSQL 17 (aucun port publie)
+      - Nginx webtest (TEMPORAIRE, aucun port publie)
+
+      Reseaux EXTERNES communs crees par /opt/plateforme/deploy.sh :
+      - plateforme-exposition : Traefik
+      - plateforme-applicatif : Traefik + futures interfaces applicatives
+      - plateforme-donnees : --internal, postgres + applications avec besoin BD
+
+      Bases PostgreSQL et proprietaires crees:
+      - moodle/moodle ; keycloak/keycloak ; drupal/drupal ; n8n/n8n
+      Connexion depuis vos applications: hote Docker "postgres", port 5432,
+      UNIQUEMENT si le service est membre de plateforme-donnees.
+
+      Secrets generes localement (NON versionnes dans GitHub):
+      /opt/plateforme/secrets/postgres_admin_password
+      /opt/plateforme/secrets/moodle_db_password
+      /opt/plateforme/secrets/keycloak_db_password
+      /opt/plateforme/secrets/drupal_db_password
+      /opt/plateforme/secrets/n8n_db_password
+      Ces fichiers se trouvent dans un repertoire prive (mode 0700).
+      Chaque collegue doit brancher la variable/secrets prise en charge par SON image.
+      NE PAS supprimer/regenerer les secrets avec le volume PostgreSQL existant.
+      NE PAS copier ces secrets dans cloud-init, GitHub, un .env suivi ou GitBook.
+
+      Exemples de declaration de reseaux dans un futur fichier Compose:
+      networks:
+        applicatif:
+          external: true
+          name: plateforme-applicatif
+        donnees:
+          external: true
+          name: plateforme-donnees
+      Les applications publiques utilisent applicatif; les applis avec BD ont
+      besoin EN PLUS de donnees. Traefik ne doit pas rejoindre donnees.
+
+      Routage actuel du test: Host demo.localhost -> webtest:80.
+      Ajouter les vraies routes a /opt/traefik/dynamic.yaml puis relancer Traefik.
+      AUCUN HTTPS, SSO, WAF, controle d'acces admin ou exposition externe ici.
+      Ces mesures sont a integrer/valider avant toute publication Internet.
+
+      Test sur la VM:
+        docker context show
+        docker info | grep -A 6 'Security Options'
+        sudo cloud-init status --wait
+        curl http://127.0.0.1:8080/ping
+        curl -I -H 'Host: demo.localhost' http://127.0.0.1:8080/
+        docker compose -f /opt/postgresql/docker-compose.yml ps
+        docker network inspect plateforme-donnees --format '{{.Internal}}'
+
+      L'initialisation des bases n'est faite que sur un volume PostgreSQL neuf.
+      Le demon est persistant via systemd --user + linger; les services via
+      restart: unless-stopped. "runcmd" n'est execute qu'au premier boot.
+
+
+# ==============================================================
+# RUNCMD : au premier demarrage, une fois les fichiers disponibles
+# ==============================================================
+runcmd:
+  # 1) Installe les paquets Docker, arrete le daemon rootful et active UFW.
+  - [bash, /usr/local/sbin/prepare-docker-rootless.sh]
+  # 2) Active le daemon Docker Rootless de ubuntu ; verifie qu il est pret.
+  - [bash, /usr/local/sbin/activate-docker-rootless.sh]
+  # 3) Cree les secrets/reseaux, lance Compose et valide PostgreSQL/Traefik.
+  - [bash, /opt/plateforme/deploy.sh]
+
+# Texte de fin cloud-init. Il ne remplace PAS la verification des journaux.
+final_message: "Cloud-init CR465 termine; verifier /var/log/cloud-init-output.log et /opt/plateforme/README-INTEGRATION.txt"
