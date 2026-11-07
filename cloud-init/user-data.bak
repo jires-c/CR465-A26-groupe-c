@@ -1,0 +1,53 @@
+#cloud-config
+ssh_pwauth: false
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - ufw
+
+users:
+  - default
+  - name: acadmin
+    groups:
+      - sudo
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      -  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH8gufaY3JfIUtXuvNZwFej4YgwBgz7Q37RoDunH5llg rolande
+      -  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJGl+/uwcjakWZEwgie5YbXjK3NOzbzFwniE5rDeI+r0 Eljoe
+      -  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPbYsFtZ2uBD4F9tUQxirK3TDgwjdl4m36rPL4LmSVoe jires
+      -  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMOGp8S05dB0TeFQYkC5A6h27h0av1s+7/6oxRIpEODM rubeni
+      -  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICY2fTT3IoxTawxEXU5kCYTOIq7NRioZlajfYnM2DPwk MahdiBou
+
+runcmd:
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+    - |
+      ARCH=$(dpkg --print-architecture)
+      . /etc/os-release
+      CODENAME=${UBUNTU_CODENAME:-$VERSION_CODENAME}
+
+      cat > /etc/apt/sources.list.d/docker.sources <<EOF
+      Types: deb
+      URIs: https://download.docker.com/linux/ubuntu
+      Suites: $CODENAME
+      Components: stable
+      Architectures: $ARCH
+      Signed-By: /etc/apt/keyrings/docker.asc
+      EOF
+   - apt-get update
+   - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+   - systemctl enable --now docker
+   - mkdir -p /opt/ac-platform
+   - mkdir -p /opt/ac-platform/compose
+   - chown -R acadmin:acadmin /opt/ac-platform
+   - ufw default deny incoming
+   - ufw default allow outgoing
+   - ufw allow OpenSSH
+   - ufw logging on
+   - ufw --force enable
