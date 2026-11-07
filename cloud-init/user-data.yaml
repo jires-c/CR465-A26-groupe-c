@@ -1,0 +1,263 @@
+#cloud-config
+
+package_update: true
+
+packages:
+  - curl
+  - git
+  - jq
+#==============================================
+#creation des docker composes
+#================================================
+#moodel
+write_files:
+
+  - path: /opt/moodle/docker-compose.yml
+    permissions: "0644"
+    content: |
+      ... contenu compose moodle ...
+#keycloak
+  - path: /opt/keycloak/docker-compose.yml
+    permissions: "0644"
+    content: |
+      ... contenu compose keycloak ...
+
+#traefik
+  - path: /opt/traefik/docker-compose.yml
+    permissions: "0644"
+    content: |
+      ... contenu compose moodle ...
+#postgresql
+  - path: /opt/postgresql/docker-compose.yml
+    permissions: "0644"
+    content: |
+      
+      services:
+
+      postgres:
+
+        image: postgres:17
+
+        container_name: postgres
+
+        hostname: postgres
+
+        restart: unless-stopped
+
+        env_file:
+          - .env
+
+        environment:
+
+          POSTGRES_USER: ${POSTGRES_USER}
+
+          POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+        volumes:
+
+          - postgres_data:/var/lib/postgresql/data
+
+          - ./initdb:/docker-entrypoint-initdb.d
+
+        healthcheck:
+
+          test:
+            [
+              "CMD-SHELL",
+              "pg_isready -U ${POSTGRES_USER}"
+            ]
+
+          interval: 30s
+
+          timeout: 10s
+
+          retries: 5
+
+        networks:
+          - backend
+
+    volumes:
+
+      postgres_data:
+
+    networks:
+
+      backend:
+        driver: bridge
+
+#postgresql .en
+  - path: /opt/postgresql/.env
+    permissions: "0644"
+    content: |
+      ... contenu compose moodle ...
+      POSTGRES_USER=postgres
+      POSTGRES_PASSWORD=SuperAdminPassword123!
+
+      MOODLE_DB=moodle
+      MOODLE_USER=moodle
+      MOODLE_PASSWORD=MoodlePassword123!
+
+      KEYCLOAK_DB=keycloak
+      KEYCLOAK_USER=keycloak
+      KEYCLOAK_PASSWORD=KeycloakPassword123!
+
+      N8N_DB=n8n
+      N8N_USER=n8n
+      N8N_PASSWORD=N8NPassword123!
+
+      DRUPAL_DB=drupal
+      DRUPAL_USER=drupal
+      DRUPAL_PASSWORD=DrupalPassword123!
+
+
+#postgress/initdb   pour initialiser la bd
+  - path: /opt/postgresql/initdb/01-init.sql
+    permissions: "0644"
+    content: |
+      
+      -- Moodle
+
+      CREATE USER moodle
+      WITH ENCRYPTED PASSWORD 'MoodlePassword123!';
+
+      CREATE DATABASE moodle;
+
+      GRANT ALL PRIVILEGES
+      ON DATABASE moodle
+      TO moodle;
+
+      --------------------------------------------------
+
+      -- Keycloak
+
+      CREATE USER keycloak
+      WITH ENCRYPTED PASSWORD 'KeycloakPassword123!';
+
+      CREATE DATABASE keycloak;
+
+      GRANT ALL PRIVILEGES
+      ON DATABASE keycloak
+      TO keycloak;
+
+      --------------------------------------------------
+
+      -- n8n
+
+      CREATE USER n8n
+      WITH ENCRYPTED PASSWORD 'N8NPassword123!';
+
+      CREATE DATABASE n8n;
+
+      GRANT ALL PRIVILEGES
+      ON DATABASE n8n
+      TO n8n;
+
+      --------------------------------------------------
+
+      -- Drupal
+
+      CREATE USER drupal
+      WITH ENCRYPTED PASSWORD 'DrupalPassword123!';
+
+      CREATE DATABASE drupal;
+
+      GRANT ALL PRIVILEGES
+      ON DATABASE drupal
+      TO drupal;
+
+#portainer
+  - path: /opt/portainer/docker-compose.yml
+    permissions: "0644"
+    content: |
+      ... contenu compose moodle ...
+      services:
+
+      portainer:
+
+        image: portainer/portainer-ce:lts
+
+        container_name: portainer
+
+        restart: unless-stopped
+
+        command:
+          - --admin-password=$2y$05$YwP5.....
+
+        ports:
+          - "9000:9000"
+
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+          - portainer_data:/data
+
+      volumes:
+        portainer_data:
+#portainer/init-portainer.sh
+  - path: /opt/portainer/init-portainer.sh
+    permissions: "0644"
+    content: |
+      ... contenu compose keycloak ...
+      #!/bin/bash
+
+      sleep 60
+
+      curl -k \
+      -X POST \
+      https://localhost:9443/api/users/admin/init \
+      -H "Content-Type: application/json" \
+      -d '
+      {
+        "Username":"admin",
+        "Password":"SuperPassword123!"
+      }'
+#Drupal
+  - path: /opt/keycloak/docker-compose.yml
+    permissions: "0644"
+    content: |
+      ... contenu compose keycloak ...
+#n8n
+  - path: /opt/n8n/docker-compose.yml
+    permissions: "0644"
+    content: |
+      ... contenu compose moodle ...
+#redis
+  - path: /opt/redis/docker-compose.yml
+    permissions: "0644"
+    content: |
+      ... contenu compose keycloak ...
+#grafan
+  - path: /opt/grafana/docker-compose.yml
+    permissions: "0644"
+    content: |
+      ... contenu compose moodle ...
+#openappsec
+  - path: /opt/OpenAppsec/docker-compose.yml
+    permissions: "0644"
+    content: |
+      ... contenu compose keycloak ...
+
+runcmd:
+#================================================
+#docker rootless
+#==============================================
+
+
+#================================================
+#Demarrage des containers
+#==================================================
+  
+
+  - docker compose -f /opt/postgres/docker-compose.yml up -d
+
+  - sleep 30
+
+  - docker compose -f /opt/keycloak/docker-compose.yml up -d
+
+  - docker compose -f /opt/moodle/docker-compose.yml up -d
+
+  - docker compose -f /opt/n8n/docker-compose.yml up -d
+
+  - docker compose -f /opt/grafana/docker-compose.yml up -d
+  - docker compose -f /opt/portainer/docker-compose.yml up -d
+
+  - /opt/portainer/init-portainer.sh
