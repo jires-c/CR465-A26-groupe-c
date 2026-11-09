@@ -6,93 +6,236 @@ packages:
   - curl
   - git
   - jq
+  - uidmap
+  - dbus-user-session
+  - slirp4netns
+  - fuse-overlayfs
+  - ufw
+  - openssl
+
+#==========================================================
+# Preparations des fichier pour installer docker rootless
+#==========================================================
+write_files:
+  - path: /usr/local/sbin/prepare-docker-rootless.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+      chmod a+r /etc/apt/keyrings/docker.asc
+      cat > /etc/apt/sources.list.d/docker.sources <<SOURCES
+      Types: deb
+      URIs: https://download.docker.com/linux/ubuntu
+      Suites: noble
+      Components: stable
+      Architectures: $(dpkg --print-architecture)
+      Signed-By: /etc/apt/keyrings/docker.asc
+      SOURCES
+      apt-get update
+      apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras    
+      systemctl disable --now docker.service docker.socket
+      rm -f /run/docker.sock
+      ufw allow 22/tcp
+      ufw --force enable     
+
+
+  - path: /usr/local/sbin/activate-docker-rootless.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail      
+      DOCKER_USER=ubuntu      
+      USER_ID="$(id -u "$DOCKER_USER")"      
+      RUNTIME_DIR="/run/user/${USER_ID}"      
+      BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"      
+      for file in /etc/subuid /etc/subgid; do        
+        if ! awk -F: '$1 == "ubuntu" && $3 >= 65536 {ok=1} END{exit !ok}' "$file"; then
+          echo "ERREUR: plage UID/GID insuffisante dans $file" >&2
+          exit 1
+        fi
+      done
+
+      loginctl enable-linger "$DOCKER_USER"      
+      systemctl start "user@${USER_ID}.service"      
+      for i in $(seq 1 30); do
+        [ -S "${RUNTIME_DIR}/bus" ] && break
+        sleep 1
+      done
+      
+      [ -S "${RUNTIME_DIR}/bus" ] || { echo 'ERREUR: bus systemd absent' >&2; exit 1; }
+
+      
+      user_cmd() {
+        runuser -u "$DOCKER_USER" -- env \
+          HOME="/home/${DOCKER_USER}" USER="$DOCKER_USER" LOGNAME="$DOCKER_USER" \
+          XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+          DBUS_SESSION_BUS_ADDRESS="$BUS_ADDRESS" \
+          PATH="/usr/local/bin:/usr/bin:/bin" "$@"
+      }
+
+      
+      user_cmd dockerd-rootless-setuptool.sh install      
+      user_cmd systemctl --user enable --now docker.service      
+      user_cmd docker context use rootless      
+      verified=no      
+      for i in $(seq 1 30); do       
+        if user_cmd docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -q rootless; then
+          verified=yes
+          break
+        fi
+        sleep 2
+      done      
+      [ "$verified" = yes ] || { echo 'ERREUR: Docker Rootless non operationnel' >&2; exit 1; }
+      echo 'SUCCES: Docker Rootless installe et actif sous ubuntu'      
+      user_cmd docker info --format '{{json .SecurityOptions}}'
+
+      
+
 #==============================================
 #creation des docker composes
 #================================================
-#moodel
-write_files:
+  - path:  /opt/GroupeC/traefik/dynamic/tls.yaml
+    owner: root:root
+    permissions: "0777"
+    content: |
 
-  - path: /opt/moodle/docker-compose.yml
-    permissions: "0644"
-    content: |
-      ... contenu compose moodle ...
-#keycloak
-  - path: /opt/keycloak/docker-compose.yml
-    permissions: "0644"
-    content: |
-      ... contenu compose keycloak ...
+      tls:
+        certificates:
+          - certFile: /certs/local.crt
+            keyFile:  /certs/local.key
 
 #traefik
-  - path: /opt/traefik/docker-compose.yml
-    permissions: "0644"
-    content: |
-      ... contenu compose moodle ...
-#postgresql
-  - path: /opt/postgresql/docker-compose.yml
-    permissions: "0644"
+  - path: /opt/GroupeC/traefik/docker-compose.yml
+    owner: root:root
+    permissions: "0777"
     content: |
       
       services:
 
-      postgres:
+        cert-generator:
+          image: alpine:latest
+          container_name: cert-generator
+          volumes:
+            - ./certs:/certs
+          entrypoint: /bin/sh
+          command:
+            - -c
+            - |
+              apk add --no-cache openssl
+              
+                            
+              if [ ! -f /certs/local.crt ] || [ ! -f /certs/local.key ]; then
+                openssl req -x509 -nodes -days 365 \
+                  -newkey rsa:2048 \
+                  -keyout /certs/local.key \
+                  -out /certs/local.crt \
+                  -subj "/CN=dashboard.docker.localhost" \
+                  -addext "subjectAltName=DNS:localhost,DNS:*.localhost,DNS:*.local,IP:127.0.0.1"
+                chmod 600 /certs/local.key
+                chmod 644 /certs/local.crt
+              fi
 
-        image: postgres:17
+          restart: "no"
 
-        container_name: postgres
+       
+      
+            
+      
+        traefik:
+          image: traefik:v3.7
+          depends_on:
+            cert-generator:
+              condition: service_completed_successfully
+          container_name: traefik
+          restart: unless-stopped
 
-        hostname: postgres
+          security_opt:
+            - no-new-privileges:true
 
-        restart: unless-stopped
+          ports:
+            - "8080:8080"
+            - "8081:80"
+            - "4443:443"
 
-        env_file:
-          - .env
+          volumes:
+            # Docker Rootless socket
+            - /run/user/1000/docker.sock:/var/run/docker.sock
 
-        environment:
+            # Certificates
+            - ./certs:/certs:ro
 
-          POSTGRES_USER: ${POSTGRES_USER}
+            # Dynamic configuration
+            - ./dynamic:/dynamic:ro
 
-          POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+          command:
 
-        volumes:
+            - "--entrypoints.web.address=:80"
+            - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+            - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+            - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+            - "--entrypoints.websecure.address=:443"
+            - "--entrypoints.websecure.http.tls=true"
 
-          - postgres_data:/var/lib/postgresql/data
+            # File provider
+            - "--providers.file.filename=/dynamic/tls.yaml"
+            - "--providers.file.watch=true"
 
-          - ./initdb:/docker-entrypoint-initdb.d
+            # Docker provider
+            - "--providers.docker=true"
+            - "--providers.docker.endpoint=unix:///var/run/docker.sock"
+            - "--providers.docker.exposedbydefault=false"
+            - "--providers.docker.network=GroupeC-exposition"
 
-        healthcheck:
+            # API & Dashboard
+            - "--api=true"
+            - "--api.dashboard=true"
+            - "--api.insecure=true"
 
-          test:
-            [
-              "CMD-SHELL",
-              "pg_isready -U ${POSTGRES_USER}"
-            ]
+            # Logs and metrics
+            - "--log.level=INFO"
+            - "--accesslog=true"
+            - "--metrics.prometheus=true"
 
-          interval: 30s
+          labels:
+            # Enable Traefik
+            - "traefik.enable=true"
 
-          timeout: 10s
+            # Dashboard router
+            - "traefik.http.routers.dashboard.rule=HostRegexp(`{catchall:.*}`)"
+            - "traefik.http.routers.dashboard.entrypoints=websecure"
+            - "traefik.http.routers.dashboard.service=api@internal"
+            - "traefik.http.routers.dashboard.tls=true"
 
-          retries: 5
+            # Basic Authentication
+            #- "traefik.http.middlewares.dashboard-auth.basicauth.users=REPLACE_WITH_HASH"
+            #- "traefik.http.routers.dashboard.middlewares=dashboard-auth@docker"
 
-        networks:
-          - backend
+          networks:
+            - exposition
+            - applicatif
 
-    volumes:
+      # Shared Docker networks
+      networks:
+        exposition:
+          name: GroupeC-exposition
 
-      postgres_data:
+        applicatif:
+          name: GroupeC-applicatif
+          
 
-    networks:
-
-      backend:
-        driver: bridge
-
-#postgresql .en
-  - path: /opt/postgresql/.env
+#les variables utiliser dans le projets .en
+  - path: /opt/GroupeC/.env
     permissions: "0644"
+    owner: root:root
     content: |
-      ... contenu compose moodle ...
-      POSTGRES_USER=postgres
-      POSTGRES_PASSWORD=SuperAdminPassword123!
 
+      POSTGRES_USER: postgres      
+      POSTGRES_PASSWORD:  postgres
       MOODLE_DB=moodle
       MOODLE_USER=moodle
       MOODLE_PASSWORD=MoodlePassword123!
@@ -109,9 +252,301 @@ write_files:
       DRUPAL_USER=drupal
       DRUPAL_PASSWORD=DrupalPassword123!
 
+  - path: /opt/GroupeC/postgresql/initdb/01-init.sql
+    permissions: "0644"
+    content: |
+      
+      -- Moodle
+
+      CREATE USER moodle
+      WITH ENCRYPTED PASSWORD 'MoodlePassword123!';
+
+      CREATE DATABASE moodle;
+
+      GRANT ALL PRIVILEGES
+      ON DATABASE moodle
+      TO moodle;
+
+      --------------------------------------------------
+
+      -- Keycloak
+
+      CREATE USER keycloak
+      WITH ENCRYPTED PASSWORD 'KeycloakPassword123!';
+
+      CREATE DATABASE keycloak;
+
+      GRANT ALL PRIVILEGES
+      ON DATABASE keycloak
+      TO keycloak;
+
+      --------------------------------------------------
+
+      -- n8n
+
+      CREATE USER n8n
+      WITH ENCRYPTED PASSWORD 'N8NPassword123!';
+
+      CREATE DATABASE n8n;
+
+      GRANT ALL PRIVILEGES
+      ON DATABASE n8n
+      TO n8n;
+
+      --------------------------------------------------
+
+      -- Drupal
+
+      CREATE USER drupal
+      WITH ENCRYPTED PASSWORD 'DrupalPassword123!';
+
+      CREATE DATABASE drupal;
+
+      GRANT ALL PRIVILEGES
+      ON DATABASE drupal
+      TO drupal;
+
+
+#postgresql
+  - path: /opt/GroupeC/postgresql/docker-compose.yml
+    permissions: "0644"
+    owner: root:root
+    content: |
+      name: GroupeC-postgresql      
+      services:        
+        postgres:          
+          image: postgres:17          
+          restart: unless-stopped 
+          env_file:
+            - ../.env         
+          environment:
+            POSTGRES_USER: ${POSTGRES_USER:-postgres}       
+            POSTGRES_PASSWORD:  ${POSTGRES_PASSWORD:-postgres}
+                      
+          volumes:            
+            - postgres_data:/var/lib/postgresql/data            
+            - /opt/GroupeC/postgresql/initdb/01-init.sql:/docker-entrypoint-initdb.d/init.sql:ro         
+         
+          healthcheck:
+            # EXPLICATION : pg_isready teste si PostgreSQL est pret ; ne verifie pas toutes les applications ni leurs schemas.
+            test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+            # EXPLICATION : Lance le healthcheck toutes les 5 secondes.
+            interval: 30s
+            # EXPLICATION : Un essai expire apres 3 secondes.
+            timeout: 10s
+            # EXPLICATION : Apres 30 echecs consecutifs, Docker peut declarer le conteneur unhealthy.
+            retries: 5
+            
+      volumes:
+        postgres_data:
+
+      # EXPLICATION : PostgreSQL rejoint UNIQUEMENT le reseau de donnees.
+      networks:
+        donnees:
+          name: GroupeC-donnees
+
+  # Script d initialisation SQL execute par l image PostgreSQL au premier demarrage de la BD.
+  - path: /opt/GroupeC/postgresql/initdb/01-init-databases.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      # EXPLICATION : Arrete le script d initialisation si une commande, variable ou pipeline echoue.
+      set -euo pipefail
+
+      # Lance par le point d'entree de postgres:17 UNIQUEMENT sur volume vide.
+      # Secrets generes sur la VM et montes dans /run/secrets; pas dans GitHub.
+      # Noms de bases/roles fixes et mots de passe aleatoires hexadecimaux.
+      # EXPLICATION : Repete la preparation pour les 4 applications necessitant une base et un role differents.
+      for app in moodle keycloak drupal n8n; do
+        # EXPLICATION : Lit le secret de l application dans le conteneur. La variable Bash ne sera pas imprimee.
+        password="$(cat "/run/secrets/${app}_db_password")"
+        # EXPLICATION : Controle que le secret est une chaine hexadecimale de 64 caracteres (32 octets aleatoires).
+        [[ "$password" =~ ^[0-9a-f]{64}$ ]] || { echo "Mot de passe invalide pour $app" >&2; exit 1; }
+
+        # \gexec execute les instructions SQL produites par SELECT sans
+        # ajouter de bloc DO ni de transaction autour de CREATE DATABASE.
+        # EXPLICATION : Ouvre psql; -X ignore les reglages utilisateur, -q est discret, ON_ERROR_STOP arrete sur SQL invalide. <<SQL commence le SQL.
+        psql -X -q -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres <<SQL
+      SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', '${app}', '${password}')
+      WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='${app}')
+      \gexec
+      SELECT format('CREATE DATABASE %I OWNER %I', '${app}', '${app}')
+      WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname='${app}')
+      \gexec
+      SQL
+        # EXPLICATION : Efface la variable temporaire de mot de passe apres creation du role.
+        unset password
+        # EXPLICATION : Affiche seulement le nom de l application dans les journaux, jamais son mot de passe.
+        echo "Base et role prets: ${app}"
+      done
+
+    
+
+         
+
+#9999999999999999999999999999999999999999999999999999999999999999999999999999
+#moodel
+
+
+  - path: /opt/GroupeC/moodle/docker-compose.yml
+    permissions: "0644"
+    content: |
+      ... contenu compose moodle ...
+#keycloak
+  - path: /opt/GroupeC/keycloak/docker-compose.yml
+    permissions: "0644"
+    content: |
+      ... contenu compose keycloak ...
+
+
+  #88888888888888888888888888888888888888888888888888888888888888888888
+  - path: /opt/GroupeC/deploy.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      # EXPLICATION : Compte non privilegie qui execute tous les appels Docker.
+      DOCKER_USER=ubuntu
+      # EXPLICATION : Determine l UID pour construire correctement les chemins runtime.
+      USER_ID="$(id -u "$DOCKER_USER")"
+      # EXPLICATION : Emplacement du socket Docker Rootless pour cet utilisateur.
+      RUNTIME_DIR="/run/user/${USER_ID}"
+      # EXPLICATION : Adresse D-Bus du gestionnaire systemd de ubuntu.
+      BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
+
+      # EXPLICATION : Fonction qui force toutes les commandes Docker a passer par le contexte de ubuntu et son daemon Rootless.
+      user_docker() {
+        runuser -u "$DOCKER_USER" -- env \
+          HOME="/home/${DOCKER_USER}" USER="$DOCKER_USER" LOGNAME="$DOCKER_USER" \
+          XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+          DBUS_SESSION_BUS_ADDRESS="$BUS_ADDRESS" \
+          DOCKER_HOST="unix://${RUNTIME_DIR}/docker.sock" \
+          PATH="/usr/local/bin:/usr/bin:/bin" docker "$@"
+      }
+
+      # EXPLICATION : Verification de securite bloquante : si Docker n est pas Rootless, pas de deploiement.
+      user_docker info --format '{{json .SecurityOptions}}' | grep -q rootless || {
+        echo 'ERREUR: moteur Docker non-rootless' >&2; exit 1;
+      }
+
+      # Repertoires projets sous /opt ; les collegues ajouteront leurs Compose.
+      # EXPLICATION : Cree les repertoires /opt de la base et reserve ceux des futurs projets de vos collegues.
+      for folder in traefik postgresql webtest moodle drupal keycloak n8n portainer; do
+        # EXPLICATION : Cree le dossier s il manque ; 0755 permet la lecture et l acces, mais pas l ecriture a tous.
+        install -d -m 0755 "/opt/${folder}"
+      done
+      # EXPLICATION : Donne a ubuntu la propriete des repertoires Compose de la base (attention: pas un droit root).
+      chown -R ubuntu:ubuntu /opt/traefik /opt/postgresql /opt/webtest
+
+      # Dossier secret non accessible aux autres utilisateurs de l'hote.
+      # EXPLICATION : Cree le dossier des secrets avec proprietaire ubuntu et droits 0700 (aucun acces aux autres comptes ordinaires).
+      install -d -o ubuntu -g ubuntu -m 0700 /opt/GroupeC/secrets
+      # EXPLICATION : Prepare une liste distincte de 5 secrets : administrateur et 4 services applicatifs.
+      for secret in postgres_admin_password moodle_db_password keycloak_db_password drupal_db_password n8n_db_password; do
+        # EXPLICATION : Construit le chemin cible pour chaque secret.
+        file="/opt/GroupeC/secrets/${secret}"
+        # EXPLICATION : Genere seulement si le secret est absent/vide ; conserve les mots de passe lors des prochains deploiements.
+        if [ ! -s "$file" ]; then
+          # EXPLICATION : Genere 32 octets aleatoires et les ecrit sous forme de 64 caracteres hexadecimaux.
+          ( umask 077; openssl rand -hex 32 > "$file" )
+        fi
+        # EXPLICATION : Autorise le moteur Docker Rootless de ubuntu a lire le secret local.
+        chown ubuntu:ubuntu "$file"
+        # La lecture par l'UID postgres dans le conteneur requiert un mode lisible.
+        # Sur l'hote, le repertoire parent 0700 protege l'acces a ces fichiers.
+        # EXPLICATION : Fichier lisible, MAIS contenu dans un dossier 0700. Sert a permettre la lecture depuis les montages secrets.
+        chmod 0644 "$file"
+      done
+
+      # Trois reseaux communs entre Compose independants.
+      # EXPLICATION : Prepare les deux reseaux bridges de communication des services exposes et applicatifs.
+      for network in GroupeC-exposition GroupeC-applicatif; do
+        # EXPLICATION : Teste l existence du reseau sans creer de doublon ; redirige les sorties vers /dev/null.
+        if ! user_docker network inspect "$network" >/dev/null 2>&1; then
+          # EXPLICATION : Cree le reseau bridge sous le daemon Rootless de ubuntu.
+          user_docker network create --driver bridge "$network"
+        fi
+      done
+      # EXPLICATION : Cree la zone donnees seulement si elle n existe pas deja.
+      if ! user_docker network inspect GroupeC-donnees >/dev/null 2>&1; then
+        # EXPLICATION : Cree un reseau Docker internal : pas de connectivite externe directe pour cette interface.
+        user_docker network create --driver bridge --internal GroupeC-donnees
+      fi
+      # EXPLICATION : Controle que le reseau donnees existant/cree est effectivement marque internal=true.
+      [ "$(user_docker network inspect --format '{{.Internal}}' GroupeC-donnees)" = true ] || {
+        echo 'ERREUR: le reseau GroupeC-donnees doit etre internal=true' >&2; exit 1;
+      }
+
+      # Verification de la syntaxe Compose avant toute creation de conteneurs.
+      # EXPLICATION : Valide les trois Compose de notre base commune avant de creer les conteneurs.
+      for service in postgresql traefik webtest; do
+        # EXPLICATION : Analyse la configuration Compose, -f selectionne le fichier, --quiet supprime la sortie en cas de succes.
+        user_docker compose -f "/opt/$service/docker-compose.yml" config --quiet
+      done
+
+      # L'ordre PostgreSQL/Traefik est interchangeable; les applications ne
+      # doivent demarrer qu'une fois leur base disponible.
+      # EXPLICATION : Demarre PostgreSQL en arriere-plan (-d) et cree son volume permanent.
+      user_docker compose -f /opt/GroupeC/postgresql/docker-compose.yml up -d
+      # EXPLICATION : Demarre le reverse proxy Traefik et ses deux interfaces Docker.
+      user_docker compose -f /opt/GroupeC/traefik/docker-compose.yml up -d
+      # EXPLICATION : Demarre Nginx pour que Traefik ait une destination testable.
+      #user_docker compose -f /opt/webtest/docker-compose.yml up -d
+
+      # Verifier que les quatre bases ont ete creees, et pas juste que le port est ouvert.
+      # EXPLICATION : Drapeau initial de validation des bases, independant du simple demarrage du conteneur.
+      ready=no
+      # EXPLICATION : Jusqu a 90 tentatives pour constater l initialisation SQL, sans delai fixe arbitraire.
+      for i in $(seq 1 90); do
+        # EXPLICATION : Execute une requete dans le conteneur PostgreSQL ; -T desactive le pseudo-terminal (compatible automatisation).
+        count="$(user_docker compose -f /opt/GroupeC/postgresql/docker-compose.yml exec -T postgres \
+          psql -U postgres -d postgres -tAc \
+          "SELECT count(*) FROM pg_database WHERE datname IN ('moodle','keycloak','drupal','n8n')" 2>/dev/null || true)"
+        # EXPLICATION : Le SELECT doit confirmer les quatre noms de bases applicatives.
+        if [ "$count" = 4 ]; then
+          ready=yes
+          break
+        fi
+        sleep 2
+      done
+      # EXPLICATION : Interrompt le provisionnement si l initialisation PostgreSQL ne se termine pas.
+      [ "$ready" = yes ] || { echo 'ERREUR: PostgreSQL ou initialisation des bases' >&2; exit 1; }
+
+      # Le test HTTP passe par Traefik et NON directement par Nginx.
+      # EXPLICATION : Retente les tests HTTP pendant la phase de demarrage de Traefik et Nginx.
+      for i in $(seq 1 30); do
+        # EXPLICATION : Teste /ping et exige la reponse exacte OK avant de valider le proxy.
+        if curl -fsS http://127.0.0.1:8080/ping | grep -qx OK && \
+           curl -fsS -H 'Host: demo.localhost' http://127.0.0.1:8080/ | grep -q 'Welcome to nginx'; then
+          echo 'SUCCES: Docker Rootless, Traefik, Nginx test et PostgreSQL operationnels.'
+          exit 0
+        fi
+        sleep 2
+      done
+      # EXPLICATION : Affiche un message d echec sur stderr si les tests HTTP ne passent jamais.
+      echo 'ERREUR: validation HTTP de Traefik / webtest echouee' >&2
+      # EXPLICATION : Quitte le script avec un code non nul : cloud-init doit remonter un echec.
+      exit 1
+
+    
+
+
+
+
+
+
+#les variables utiliser dans le projets .en
+# - path: /opt/GroupeC/.env
+#    permissions: "0644"
+#    source:
+#      uri: file:///opt/GroupeC/config/exemple.env
+      
+
 
 #postgress/initdb   pour initialiser la bd
-  - path: /opt/postgresql/initdb/01-init.sql
+  - path: /opt/GroupeC/postgresql/initdb/01-init.sql
     permissions: "0644"
     content: |
       
@@ -166,7 +601,7 @@ write_files:
       TO drupal;
 
 #portainer
-  - path: /opt/portainer/docker-compose.yml
+  - path: /opt/GroupeC/portainer/docker-compose.yml
     permissions: "0644"
     content: |
       ... contenu compose moodle ...
@@ -193,7 +628,7 @@ write_files:
       volumes:
         portainer_data:
 #portainer/init-portainer.sh
-  - path: /opt/portainer/init-portainer.sh
+  - path: /opt/GroupeC/portainer/init-portainer.sh
     permissions: "0644"
     content: |
       ... contenu compose keycloak ...
@@ -211,27 +646,27 @@ write_files:
         "Password":"SuperPassword123!"
       }'
 #Drupal
-  - path: /opt/keycloak/docker-compose.yml
+  - path: /opt/GroupeC/keycloak/docker-compose.yml
     permissions: "0644"
     content: |
       ... contenu compose keycloak ...
 #n8n
-  - path: /opt/n8n/docker-compose.yml
+  - path: /opt/GroupeC/n8n/docker-compose.yml
     permissions: "0644"
     content: |
       ... contenu compose moodle ...
 #redis
-  - path: /opt/redis/docker-compose.yml
+  - path: /opt/GroupeC/redis/docker-compose.yml
     permissions: "0644"
     content: |
       ... contenu compose keycloak ...
 #grafan
-  - path: /opt/grafana/docker-compose.yml
+  - path: /opt/GroupeC/grafana/docker-compose.yml
     permissions: "0644"
     content: |
       ... contenu compose moodle ...
 #openappsec
-  - path: /opt/OpenAppsec/docker-compose.yml
+  - path: /opt/GroupeC/OpenAppsec/docker-compose.yml
     permissions: "0644"
     content: |
       ... contenu compose keycloak ...
@@ -240,24 +675,60 @@ runcmd:
 #================================================
 #docker rootless
 #==============================================
+  - [bash, /usr/local/sbin/prepare-docker-rootless.sh]
+  # 2) Active le daemon Docker Rootless de ubuntu ; verifie qu il est pret.
+  - [bash, /usr/local/sbin/activate-docker-rootless.sh]
+  # 3) Cree les secrets/reseaux, lance Compose et valide PostgreSQL/Traefik.
+  #- [bash, /opt/GroupeC/deploy.sh]
+  - | 
+      sudo mkdir -p /opt/GroupeC/traefik/certs
+      sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout certs/local.key -out certs/local.crt \
+        -subj "/CN=*.docker.localhost"
+
+  #- | 
+      
+      
+  - sudo chown -R ubuntu:ubuntu /opt/GroupeC
+  - sudo -u ubuntu docker compose -f /opt/GroupeC/traefik/docker-compose.yml up -d
+  - sudo ufw allow 8080
+  - sudo ufw allow 8081
+  - sudo ufw allow 4443
+#=================================================
+#inittialise la bd
+  - sudo -u ubuntu docker compose -f /opt/GroupeC/postgresql/docker-compose.yml up -d
+
+
+#======================================================
+# Creer la variable env de uid et gid
+#=======================================================
+  #- | 
+   #   echo "PUID=$(id -u ${DOCKER_USER})" >> /opt/GroupeC/.env
+    #  echo "PGID=$(id -g ${DOCKER_USER})" >> /opt/GroupeC/.env
 
 
 #================================================
 #Demarrage des containers
 #==================================================
   
+  
 
-  - docker compose -f /opt/postgres/docker-compose.yml up -d
+ # - docker compose -f /opt/GroupeC/postgres/docker-compose.yml up -d
 
-  - sleep 30
+  #- sleep 30
 
-  - docker compose -f /opt/keycloak/docker-compose.yml up -d
+ # - docker compose -f /opt/GroupeC/keycloak/docker-compose.yml up -d
 
-  - docker compose -f /opt/moodle/docker-compose.yml up -d
+ # - docker compose -f /opt/GroupeC/moodle/docker-compose.yml up -d
 
-  - docker compose -f /opt/n8n/docker-compose.yml up -d
+ # - docker compose -f /opt/GroupeC/n8n/docker-compose.yml up -d
 
-  - docker compose -f /opt/grafana/docker-compose.yml up -d
-  - docker compose -f /opt/portainer/docker-compose.yml up -d
+ # - docker compose -f /opt/GroupeC/grafana/docker-compose.yml up -d
+ # - docker compose -f /opt/GroupeC/portainer/docker-compose.yml up -d
 
-  - /opt/portainer/init-portainer.sh
+  #- /opt/GroupeC/portainer/init-portainer.sh
+
+
+  #========================================================
+  # adresses ip
+  - 
