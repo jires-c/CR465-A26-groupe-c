@@ -1,0 +1,47 @@
+services:
+
+  drupal:
+    image: drupal:11-apache
+
+    container_name: drupal-commerce
+
+    restart: unless-stopped
+
+    environment:
+      TZ: ${TZ}
+
+    volumes:
+      - drupal_code:/var/www/html
+      - drupal_modules:/var/www/html/modules
+      - drupal_profiles:/var/www/html/profiles
+      - drupal_sites:/var/www/html/sites
+      - drupal_themes:/var/www/html/themes
+
+    labels:
+
+      - traefik.enable=true
+
+      - traefik.docker.network=applicatif
+
+      - traefik.http.routers.drupal.rule=Host(`${DRUPAL_HOST}`)
+      - traefik.http.routers.drupal.entrypoints=websecure
+      - traefik.http.routers.drupal.tls=true
+      - traefik.http.routers.drupal.tls.certresolver=letsencrypt
+
+      - traefik.http.services.drupal.loadbalancer.server.port=80
+
+    networks:
+      - applicatif
+
+volumes:
+
+  drupal_code:
+  drupal_modules:
+  drupal_profiles:
+  drupal_sites:
+  drupal_themes:
+
+networks:
+
+  applicatif:
+    external: true

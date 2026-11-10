@@ -1,0 +1,46 @@
+services:
+
+  moodle:
+    image: bitnami/moodle:latest
+    container_name: moodle
+
+    restart: unless-stopped
+
+    environment:
+
+      # Moodle
+      MOODLE_USERNAME: ${MOODLE_USERNAME}
+      MOODLE_PASSWORD: ${MOODLE_PASSWORD}
+      MOODLE_EMAIL: ${MOODLE_EMAIL}
+
+      # Base PostgreSQL externe
+      MOODLE_DATABASE_TYPE: pgsql
+      MOODLE_DATABASE_HOST: ${POSTGRES_HOST}
+      MOODLE_DATABASE_PORT_NUMBER: ${POSTGRES_PORT}
+      MOODLE_DATABASE_NAME: ${POSTGRES_DB}
+      MOODLE_DATABASE_USER: ${POSTGRES_USER}
+      MOODLE_DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+
+    volumes:
+      - moodle_data:/bitnami/moodle
+      - moodledata:/bitnami/moodledata
+
+    networks:
+      - applicatif
+
+    labels:
+      - traefik.enable=true
+
+      - traefik.http.routers.moodle.rule=Host(`${MOODLE_HOST}`)
+      - traefik.http.routers.moodle.entrypoints=websecure
+      - traefik.http.routers.moodle.tls.certresolver=letsencrypt
+
+      - traefik.http.services.moodle.loadbalancer.server.port=8080
+
+volumes:
+  moodle_data:
+  moodledata:
+
+networks:
+  applicatif:
+    external: true

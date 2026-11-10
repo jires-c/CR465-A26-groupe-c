@@ -1,0 +1,112 @@
+    services:
+
+        cert-generator:
+          image: alpine:latest
+          container_name: cert-generator
+          volumes:
+            - ./certs:/certs
+          entrypoint: /bin/sh
+          command:
+            - -c
+            - |
+              apk add --no-cache openssl
+              
+                            
+              if [ ! -f /certs/local.crt ] || [ ! -f /certs/local.key ]; then
+                openssl req -x509 -nodes -days 365 \
+                  -newkey rsa:2048 \
+                  -keyout /certs/local.key \
+                  -out /certs/local.crt \
+                  -subj "/CN=dashboard.docker.localhost" \
+                  -addext "subjectAltName=DNS:localhost,DNS:*.localhost,DNS:*.local,IP:127.0.0.1"
+                chmod 600 /certs/local.key
+                chmod 644 /certs/local.crt
+              fi
+
+          restart: "no"
+
+       
+      
+            
+      
+        traefik:
+          image: traefik:v3.7
+          depends_on:
+            cert-generator:
+              condition: service_completed_successfully
+          container_name: traefik
+          restart: unless-stopped
+
+          security_opt:
+            - no-new-privileges:true
+
+          ports:
+            - "8080:8080"
+            - "8081:80"
+            - "4443:443"
+
+          volumes:
+            # Docker Rootless socket
+            - /run/user/1000/docker.sock:/var/run/docker.sock
+
+            # Certificates
+            - ./certs:/certs:ro
+
+            # Dynamic configuration
+            - ./dynamic:/dynamic:ro
+
+          command:
+
+            - "--entrypoints.web.address=:80"
+            - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+            - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+            - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+            - "--entrypoints.websecure.address=:443"
+            - "--entrypoints.websecure.http.tls=true"
+
+            # File provider
+            - "--providers.file.filename=/dynamic/tls.yaml"
+            - "--providers.file.watch=true"
+
+            # Docker provider
+            - "--providers.docker=true"
+            - "--providers.docker.endpoint=unix:///var/run/docker.sock"
+            - "--providers.docker.exposedbydefault=false"
+            - "--providers.docker.network=GroupeC-exposition"
+
+            # API & Dashboard
+            - "--api=true"
+            - "--api.dashboard=true"
+            - "--api.insecure=true"
+
+            # Logs and metrics
+            - "--log.level=INFO"
+            - "--accesslog=true"
+            - "--metrics.prometheus=true"
+
+          labels:
+            # Enable Traefik
+            - "traefik.enable=true"
+
+            # Dashboard router
+            - "traefik.http.routers.dashboard.rule=HostRegexp(`{catchall:.*}`)"
+            - "traefik.http.routers.dashboard.entrypoints=websecure"
+            - "traefik.http.routers.dashboard.service=api@internal"
+            - "traefik.http.routers.dashboard.tls=true"
+
+            # Basic Authentication
+            #- "traefik.http.middlewares.dashboard-auth.basicauth.users=REPLACE_WITH_HASH"
+            #- "traefik.http.routers.dashboard.middlewares=dashboard-auth@docker"
+
+          networks:
+            - exposition
+            - applicatif
+
+      # Shared Docker networks
+      networks:
+        exposition:
+          name: GroupeC-exposition
+
+        applicatif:
+          name: GroupeC-applicatif
+          
