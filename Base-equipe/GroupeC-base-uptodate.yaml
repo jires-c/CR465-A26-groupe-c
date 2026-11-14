@@ -14,8 +14,6 @@
 #   - Moodle, Keycloak, Drupal Commerce, n8n, Portainer CE (obligatoires)
 #   - Opencast (optionnel), Redis et OpenAppSec (bonus), Grafana/Loki (facultatif)
 #   - Leurs emplacements write_files sont reserves COMMENTES.
-#
-# LE CODE N A PAS ETE TESTE SUR MULTIPASS EN LIVE : executer sur une VM neuve.
 # NE PAS REUTILISER UNE VM CONTENANT DEJA UN VOLUME POSTGRESQL.
 # ============================================================================
 
