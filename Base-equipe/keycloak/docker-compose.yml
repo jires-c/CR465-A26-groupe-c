@@ -1,0 +1,57 @@
+# KEYCLOAK - EMPLACEMENT A COMPLETER PAR LE MEMBRE RESPONSABLE.
+# Mission : Fournisseur identite SSO.
+# CE FICHIER EST INTENTIONNELLEMENT UN GABARIT COMMENTE ; NE PAS LE LANCER.
+# Coller ici un vrai Docker Compose et retirer ces commentaires au besoin.
+# Nom de service recommande : keycloak.
+# Traefik doit joindre ce service par GroupeC-applicatif, sans port hote public.
+# PostgreSQL: hote "postgres", port 5432, base "keycloak", role "keycloak".
+# Secret: /opt/GroupeC/secrets/keycloak_db_password (valeur generee par deploy.sh).
+# Le service doit appartenir aux DEUX reseaux GroupeC-applicatif et GroupeC-donnees.
+# Reseaux EXTERNES a reutiliser, selon le besoin:
+# networks:
+#   applicatif:
+#     external: true
+#     name: GroupeC-applicatif
+#   donnees:
+#     external: true
+#     name: GroupeC-donnees
+# Configurer OIDC / SSO Keycloak -> Moodle APRES la mise en service.
+
+name: groupec-keycloak
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.2
+    restart: unless-stopped
+
+    command:
+      - start
+      - --import-realm
+
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD:?DB password required}
+
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_BOOTSTRAP_ADMIN_PASSWORD:?Admin password required}
+
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME: https://keycloak.localhost:4443
+      KC_PROXY_HEADERS: xforwarded
+
+    networks:
+      - applicatif
+      - donnees
+    volumes:
+      - ./groupec-realm.json:/opt/keycloak/data/import/groupec-realm.json:ro
+
+networks:
+  applicatif:
+    external: true
+    name: GroupeC-applicatif
+
+  donnees:
+    external: true
+    name: GroupeC-donnees

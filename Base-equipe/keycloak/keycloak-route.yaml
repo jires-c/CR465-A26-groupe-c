@@ -1,0 +1,15 @@
+
+http:
+  routers:
+    keycloak:
+      rule: "Host(`keycloak.localhost`)"
+      entryPoints:
+        - websecure
+      service: keycloak-service
+      tls: {}
+
+  services:
+    keycloak-service:
+      loadBalancer:
+        servers:
+          - url: "http://keycloak:8080"
