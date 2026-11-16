@@ -1,3 +1,6 @@
+# CR465 - Routage HTTPS de Moodle avec Traefik
+# Traefik reçoit les requêtes HTTPS sur le port 4443.
+
 http:
   routers:
     moodle:
@@ -7,6 +10,8 @@ http:
       service: moodle-service
       tls: {}
 
+# Transmission des requêtes vers le conteneur Moodle
+# Moodle écoute sur le port 8080 du réseau Docker.
   services:
     moodle-service:
       loadBalancer:

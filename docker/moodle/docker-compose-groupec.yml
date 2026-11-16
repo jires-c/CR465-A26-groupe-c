@@ -1,3 +1,4 @@
+# Service Moodle : plateforme d'apprentissage du projet CR465
 
 services:
 
@@ -8,13 +9,13 @@ services:
     restart: unless-stopped
 
     environment:
-      # Configuration Moodle
+# Configuration Moodle
       SITE_URL: "https://moodle.localhost:4443"
       MOODLE_USERNAME: ${MOODLE_USERNAME}
       MOODLE_PASSWORD: ${MOODLE_PASSWORD}
       MOODLE_EMAIL: ${MOODLE_EMAIL}
 
-      # Configuration PostgreSQL
+# Configuration PostgreSQL : connexion à la base Moodle de GroupeC
       DB_TYPE: pgsql
       DB_HOST: ${MOODLE_DB_HOST}
       DB_PORT: "5432"
@@ -22,9 +23,11 @@ services:
       DB_USER: ${MOODLE_DB_USER}
       DB_PASS: ${MOODLE_DB_PASSWORD}
 
-      # Reverse proxy
+# Reverse proxy : configuration HTTPS derrière Traefik
       REVERSEPROXY: "false"
       SSLPROXY: "true"
+
+# Stockage persistant : conservation des données Moodle
 
     volumes:
       - moodledata:/var/www/moodledata
@@ -36,6 +39,11 @@ services:
 
 volumes:
   moodledata:
+
+
+# Réseaux Docker :
+# - GroupeC-applicatif : communication avec Traefik
+# - GroupeC-donnees : communication avec PostgreSQL
 
 networks:
   frontend:
