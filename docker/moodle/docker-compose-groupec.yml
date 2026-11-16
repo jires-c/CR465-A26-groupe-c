@@ -1,0 +1,47 @@
+
+services:
+
+  moodle:
+    image: erseco/alpine-moodle:v5.3.0
+    container_name: moodle
+
+    restart: unless-stopped
+
+    environment:
+      # Configuration Moodle
+      SITE_URL: "https://moodle.localhost:4443"
+      MOODLE_USERNAME: ${MOODLE_USERNAME}
+      MOODLE_PASSWORD: ${MOODLE_PASSWORD}
+      MOODLE_EMAIL: ${MOODLE_EMAIL}
+
+      # Configuration PostgreSQL
+      DB_TYPE: pgsql
+      DB_HOST: ${MOODLE_DB_HOST}
+      DB_PORT: "5432"
+      DB_NAME: ${MOODLE_DB_NAME}
+      DB_USER: ${MOODLE_DB_USER}
+      DB_PASS: ${MOODLE_DB_PASSWORD}
+
+      # Reverse proxy
+      REVERSEPROXY: "false"
+      SSLPROXY: "true"
+
+    volumes:
+      - moodledata:/var/www/moodledata
+
+    networks:
+      - frontend
+      - database
+
+
+volumes:
+  moodledata:
+
+networks:
+  frontend:
+    external: true
+    name: GroupeC-applicatif
+
+  database:
+    external: true
+    name: GroupeC-donnees

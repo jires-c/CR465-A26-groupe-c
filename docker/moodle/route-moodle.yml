@@ -1,0 +1,14 @@
+http:
+  routers:
+    moodle:
+      rule: "Host(`moodle.localhost`)"
+      entryPoints:
+        - websecure
+      service: moodle-service
+      tls: {}
+
+  services:
+    moodle-service:
+      loadBalancer:
+        servers:
+          - url: "http://moodle:8080"
