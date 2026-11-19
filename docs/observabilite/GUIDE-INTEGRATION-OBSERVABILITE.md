@@ -1,359 +1,457 @@
-# Guide d'intégration — Observabilité GroupeC
+# GUIDE D'INTÉGRATION — OBSERVABILITÉ
 
-## 1. Objectif
+**Projet :** CR465 — Architecture sécurisée d'une plateforme pédagogique conteneurisée sur VM
+**Composants :** Grafana 12.3.0, Loki 3.5.5 et Alloy 1.10.2
+**Branche source :** rolande
+**Environnement cible :** Ubuntu 24.04, Docker Rootless, Docker Compose et Traefik
 
-Intégrer Grafana, Loki et Grafana Alloy dans
-l'architecture Docker Rootless du projet CR465 GroupeC.
+## 1. Objectif du guide
 
-Rôles des composants :
-- Grafana : consultation et interrogation des journaux.
-- Loki : réception, stockage et recherche des journaux.
-- Alloy : collecte et transmission des journaux Docker.
+Ce document présente les étapes nécessaires pour intégrer les trois services d'observabilité à l'infrastructure commune du Groupe C.
 
-Ce guide décrit l'installation validée sur la VM
-de développement et les adaptations nécessaires
-pour son intégration dans l'environnement commun.
+L'intégration doit permettre :
 
-La reconstruction complète sur une nouvelle VM
-n'a pas encore été validée.
+- La collecte des journaux Docker par Alloy.
+- Leur transmission et leur conservation dans Loki.
+- Leur consultation dans Grafana.
+- L'accès à Grafana en HTTPS par Traefik.
 
-## 2. Fichiers à intégrer dans GitHub
+Les configurations ont déjà fait l'objet de tests sur une VM QEMU. Certaines vérifications devront être répétées sur la nouvelle VM commune, car son environnement peut être différent.
 
-grafana/docker-compose.yml
-grafana/provisioning/datasources/loki.yml
+## 2. Prérequis
 
-loki/docker-compose.yml
-loki/loki-config.yaml
+Avant de déployer l'observabilité, vérifier que :
 
-alloy/docker-compose.yml
-alloy/config.alloy
+1. La VM commune est opérationnelle.
+2. Docker Rootless et Docker Compose fonctionnent avec l'utilisateur ubuntu.
+3. Le répertoire /opt/GroupeC contient les fichiers du projet.
+4. Le réseau GroupeC-applicatif existe.
+5. Traefik est démarré.
+6. Le script de déploiement commun a généré les secrets nécessaires.
 
-Ne pas publier :
-- Les fichiers de mots de passe.
-- Les volumes Docker contenant les données.
-- Les anciennes sauvegardes des fichiers Compose.
-- Les certificats ou clés privées.
+Les commandes Docker ci-dessous doivent être exécutées dans le contexte Docker Rootless de l'utilisateur ubuntu, sauf indication contraire.
 
-## 3. Images Docker
+Les commandes supposent également que les fichiers de la branche rolande ont été intégrés dans /opt/GroupeC, sans écraser les modifications de la base commune.
 
-Grafana : grafana/grafana:12.3.0
-Loki : grafana/loki:3.5.5
-Alloy : grafana/alloy:v1.10.2
+## 3. Création du réseau d'observabilité
 
-Ces versions correspondent aux fichiers
-Compose examinés sur la VM de développement.
+Les fichiers Compose utilisent un réseau externe nommé :
 
-## 4. Réseaux Docker
-
-Deux réseaux sont nécessaires :
-
-GroupeC-applicatif
 GroupeC-observabilite
 
-Grafana utilise les deux réseaux.
+Ce réseau doit exister avant le démarrage des services.
 
-Loki et Alloy utilisent :
-GroupeC-observabilite
+Vérifier sa présence :
 
-Les fichiers Compose déclarent ces réseaux
-comme external: true.
+```bash
+docker network inspect GroupeC-observabilite
+```
 
-Ils doivent donc exister avant le déploiement.
+S'il n'existe pas, le créer :
 
-Vérification :
-docker network ls
-
-Si le réseau d'observabilité n'existe pas :
+```bash
 docker network create GroupeC-observabilite
+```
 
-Le réseau applicatif est commun au groupe.
-Sa création doit être coordonnée avec l'intégrateur.
+Cette commande crée uniquement le réseau d'observabilité. Elle ne modifie pas les réseaux communs.
 
-## 5. Volumes persistants
+Le réseau doit permettre les communications entre Grafana, Loki et Alloy.
 
-Grafana :
-grafana_grafana_data -> /var/lib/grafana
+## 4. Vérification du secret Grafana
 
-Loki :
-loki_loki_data -> /loki
+La base commune prévoit le fichier :
 
-Alloy :
-alloy_alloy_data -> /var/lib/alloy/data
-
-Les volumes sont créés par Docker Compose.
-
-Leur contenu ne doit pas être publié dans GitHub.
-
-La persistance Grafana après redémarrage
-du conteneur a été testée.
-
-Aucune restauration après perte de volume
-n'a été réalisée.
-
-## 6. Secret administrateur Grafana
-
-Chemin attendu :
 /opt/GroupeC/secrets/grafana_admin_password
 
-Le fichier Compose utilise :
-GF_SECURITY_ADMIN_PASSWORD__FILE
+### 4.1 Vérifier son existence et ses permissions
 
-Le mot de passe est lu depuis :
-/run/secrets/grafana_admin_password
+```bash
+stat -c '%a %U:%G %n' /opt/GroupeC/secrets/grafana_admin_password
+```
 
-Le script commun deploy.sh prévoit déjà
-la génération automatique du secret.
+Sur notre VM QEMU, le résultat observé était :
 
-Il utilise openssl pour produire
-une valeur aléatoire lorsque le fichier
-n'existe pas ou est vide.
+```text
+640 ubuntu:ubuntu /opt/GroupeC/secrets/grafana_admin_password
+```
 
-Permissions vérifiées sur la VM :
-640 ubuntu ubuntu
+Ces permissions autorisent la lecture par le propriétaire et le groupe, sans autoriser la lecture par les autres utilisateurs.
 
-La lecture du secret par Grafana a été testée.
+Sur la nouvelle VM, le résultat peut être différent.
 
-Attention :
-deploy.sh applique actuellement 0644
-aux secrets ordinaires.
+Ne pas appliquer automatiquement chmod 640 sans vérifier les propriétaires, groupes et droits nécessaires au fonctionnement de Grafana.
 
-Correction proposée à l'intégrateur :
-chmod 0640 "$ROOT/secrets/grafana_admin_password"
+### 4.2 Vérifier le montage du secret
 
-Cette correction doit être coordonnée
-avec le responsable du script commun.
+Notre Compose utilise :
 
-Ne jamais publier le véritable secret
-dans GitHub ou dans la documentation.
+```yaml
+environment:
+  GF_SECURITY_ADMIN_USER: admin
+  GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
 
-## 7. Déploiement Loki
+volumes:
+  - /opt/GroupeC/secrets/grafana_admin_password:/run/secrets/grafana_admin_password:ro
+```
 
-Dossier :
-/opt/GroupeC/loki
+Le fichier secret doit être présent avant le premier démarrage de Grafana.
 
-Fichiers :
-docker-compose.yml
-loki-config.yaml
+Après le démarrage, vérifier sa lisibilité :
 
-Image :
-grafana/loki:3.5.5
+```bash
+docker exec groupec-grafana sh -c 'test -r /run/secrets/grafana_admin_password && echo "LECTURE OK" || echo "LECTURE REFUSÉE"'
+```
 
-Port interne :
-3100
+Résultat attendu : LECTURE OK.
 
-Aucune publication directe du port 3100.
+Cette vérification a déjà réussi sur notre VM QEMU avec les permissions 640.
 
-Réseau :
-GroupeC-observabilite
+Elle ne vérifie pas à elle seule que le mot de passe enregistré dans Grafana correspond au contenu du secret.
 
-Volume :
-loki_loki_data
+### 4.3 Vérifier l'authentification
 
-Rétention configurée :
-168 heures, soit 7 jours.
+Lors d'une nouvelle installation, avec un volume Grafana vide, le mot de passe initial doit provenir du fichier secret.
 
-La suppression effective après 7 jours
-n'a pas été testée.
+Il faudra confirmer qu'il permet de se connecter avec l'utilisateur admin.
 
-L'authentification interne Loki est désactivée.
-Son accès doit rester limité aux composants
-autorisés du réseau Docker interne.
+Attention : si Grafana a déjà été initialisé, modifier le secret ne change pas automatiquement le mot de passe administrateur enregistré.
 
-## 8. Déploiement Alloy
+Ne pas supprimer le volume grafana_data pour résoudre un problème d'authentification sans examiner les conséquences sur les données existantes.
 
-Dossier :
-/opt/GroupeC/alloy
+### 4.4 Test effectué sur notre VM QEMU — permissions et lecture du secret
 
-Fichiers :
-docker-compose.yml
-config.alloy
+Objectif : vérifier que le fichier contenant le mot de passe administrateur Grafana est protégé et reste accessible au conteneur.
 
-Image :
-grafana/alloy:v1.10.2
+Environnement : VM Ubuntu sous QEMU, Docker Rootless.
 
-Réseau :
-GroupeC-observabilite
+Étape 1 — Vérification des permissions
 
-Volume :
-alloy_alloy_data
+Commande exécutée :
 
-Alloy lit les journaux Docker Rootless
-depuis le chemin suivant sur la VM testée :
+```bash
+stat -c '%a %U:%G %n' /opt/GroupeC/secrets/grafana_admin_password
+```
 
-/home/ubuntu/.local/share/docker/containers
+Résultat :
 
-Ce chemin est monté en lecture seule
-dans le conteneur sous /journaux.
+```text
+640 ubuntu:ubuntu /opt/GroupeC/secrets/grafana_admin_password
+```
 
-La configuration recherche :
+Le propriétaire possède les droits de lecture et d'écriture, le groupe possède le droit de lecture et les autres utilisateurs n'ont aucun droit.
+
+Étape 2 — Vérification de la lecture depuis Grafana
+
+Commande exécutée :
+
+```bash
+docker exec groupec-grafana sh -c 'test -r /run/secrets/grafana_admin_password && echo "LECTURE OK" || echo "LECTURE REFUSÉE"'
+```
+
+Résultat :
+
+```text
+LECTURE OK
+```
+
+Le processus lancé par docker exec peut lire le fichier secret monté dans le conteneur Grafana.
+
+Conclusion :
+
+Les permissions 640 sont compatibles avec la configuration actuelle du conteneur Grafana sur notre VM QEMU.
+
+Aucune modification des permissions ni du fichier Docker Compose n'a été nécessaire.
+
+Vérification restante pour l'intégration finale : confirmer que le même mécanisme fonctionne sur la nouvelle VM commune, où les propriétaires, groupes et permissions des fichiers peuvent différer.
+
+## 5. Déploiement des trois services
+
+L'ordre proposé est :
+
+1. Loki.
+2. Alloy.
+3. Grafana.
+
+Cet ordre facilite les vérifications, mais les services pourront ensuite fonctionner simultanément.
+
+### 5.1 Démarrer Loki
+
+Depuis /opt/GroupeC :
+
+```bash
+docker compose -f observabilite/loki/docker-compose.yml up -d
+```
+
+Vérifier :
+
+```bash
+docker ps --filter name=groupec-loki
+```
+
+Loki doit utiliser le réseau GroupeC-observabilite et le volume loki_data.
+
+Son port 3100 ne doit pas être publié directement sur l'hôte.
+
+### 5.2 Démarrer Alloy
+
+```bash
+docker compose -f observabilite/alloy/docker-compose.yml up -d
+```
+
+Vérifier :
+
+```bash
+docker ps --filter name=groupec-alloy
+```
+
+Alloy doit utiliser le réseau GroupeC-observabilite.
+
+Il doit également pouvoir lire les journaux Docker montés sous /journaux.
+
+### 5.3 Démarrer Grafana
+
+```bash
+docker compose -f observabilite/grafana/docker-compose.yml up -d
+```
+
+Vérifier :
+
+```bash
+docker ps --filter name=groupec-grafana
+```
+
+Grafana doit appartenir aux deux réseaux :
+
+- GroupeC-applicatif
+- GroupeC-observabilite
+
+Il doit également pouvoir lire son secret administrateur.
+
+Précaution : ces commandes supposent que les trois Compose sont déployés séparément, comme prévu par notre organisation actuelle. Si l'intégrateur les ajoute à un script commun, il devra préserver les mêmes paramètres et vérifier les noms des projets Compose et des volumes.
+
+## 6. Vérification des journaux Docker Rootless
+
+Alloy utilise le montage suivant :
+
+```yaml
+- /home/ubuntu/.local/share/docker/containers:/journaux:ro
+```
+
+Sa configuration recherche :
+
+```text
 /journaux/*/*-json.log
+```
 
-Elle utilise notamment :
-local.file_match
-loki.source.file
-loki.process
-loki.write
+### 6.1 Vérifier le pilote par défaut
 
-Destination Loki :
+```bash
+docker info --format '{{.LoggingDriver}}'
+```
+
+Résultat attendu pour notre méthode de collecte :
+
+```text
+json-file
+```
+
+Cette commande indique le pilote par défaut. Un conteneur peut toutefois utiliser un pilote différent.
+
+### 6.2 Vérifier un conteneur
+
+Remplacer NOM_DU_CONTENEUR par un conteneur réel :
+
+```bash
+docker inspect --format '{{.HostConfig.LogConfig.Type}}' NOM_DU_CONTENEUR
+```
+
+Puis vérifier le chemin de son journal :
+
+```bash
+docker inspect --format '{{.LogPath}}' NOM_DU_CONTENEUR
+```
+
+Le fichier doit correspondre au chemin attendu par le montage d'Alloy et par le motif défini dans config.alloy.
+
+Si nécessaire, le pilote peut être défini dans le Compose de l'application :
+
+```yaml
+logging:
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+```
+
+Cette configuration est prise en compte lors de la création ou recréation du conteneur.
+
+### 6.3 Vérifier les permissions
+
+Il faut confirmer qu'Alloy peut lire les journaux.
+
+Si le chemin réel diffère, vérifier le montage Docker et le motif de recherche avant de modifier la configuration.
+
+Ne pas déplacer manuellement les fichiers de journaux gérés par Docker.
+
+Ne pas modifier globalement leurs permissions sans examiner les conséquences sur la sécurité et le fonctionnement de Docker Rootless.
+
+## 7. Vérification de la communication Alloy–Loki
+
+Notre configuration Alloy transmet les journaux à :
+
+```text
 http://groupec-loki:3100/loki/api/v1/push
+```
 
-Avant le déploiement, vérifier :
-docker info --format '{{.DockerRootDir}}'
+Les deux services doivent partager le réseau GroupeC-observabilite.
 
-Le chemin des journaux doit correspondre
-à l'installation Docker Rootless cible.
+Vérifier leur présence sur ce réseau :
 
-Vérifier également que le pilote de
-journalisation produit des fichiers
-compatibles avec la collecte configurée.
+```bash
+docker network inspect GroupeC-observabilite
+```
 
-## 9. Déploiement Grafana
+Vérifier ensuite les journaux de fonctionnement :
 
-Dossier :
-/opt/GroupeC/grafana
+```bash
+docker logs --tail 50 groupec-alloy
+docker logs --tail 50 groupec-loki
+```
 
-Fichiers :
-docker-compose.yml
-provisioning/datasources/loki.yml
+Ces commandes permettent de rechercher des erreurs de lecture, de connexion ou d'envoi.
 
-Image :
-grafana/grafana:12.3.0
+La validation complète doit confirmer que les journaux d'un conteneur applicatif apparaissent effectivement dans Loki.
 
-Port interne :
-3000
+## 8. Intégration de Grafana avec Traefik
 
-Aucune publication directe du port 3000.
+### 8.1 Configuration retenue
 
-Réseaux :
-GroupeC-applicatif
-GroupeC-observabilite
+La nouvelle infrastructure commune utilise la destination :
 
-Volume :
-grafana_grafana_data
+```text
+http://grafana:3000
+```
 
-La source de données Loki est configurée
-automatiquement par provisioning.
+Notre configuration définit :
 
-Nom : Loki
-UID : loki
-Adresse : http://groupec-loki:3100
+- Service Docker Compose : grafana
+- Nom du conteneur : groupec-grafana
+- Port interne : 3000
+- Réseau partagé avec Traefik : GroupeC-applicatif
 
-## 10. Ordre de déploiement recommandé
+Aucune modification de la route Traefik n'est prévue à ce stade.
 
-1. Vérifier Docker Rootless.
-2. Préparer les dossiers et les réseaux.
-3. Générer les secrets nécessaires.
-4. Démarrer Loki.
-5. Vérifier que Loki est prêt.
-6. Démarrer Alloy.
-7. Vérifier la transmission des journaux.
-8. Démarrer Grafana.
-9. Vérifier la source Loki.
-10. Configurer et tester le routage Traefik.
+Le nom grafana correspond au nom du service Docker Compose.
 
-L'intégrateur peut automatiser cet ordre
-dans le processus de déploiement commun.
+### 8.2 Vérification restante
 
-## 11. Routage HTTPS avec Traefik
+Il faudra confirmer que Traefik peut résoudre grafana sur le réseau GroupeC-applicatif et communiquer avec le service sur le port 3000.
 
-Nom prévu :
-grafana.groupec.test
+Cette vérification doit être effectuée dans l'environnement intégré.
 
-Adresse prévue :
+Important : la compatibilité de configuration a été examinée, mais la communication réelle avec la nouvelle base commune n'a pas encore été validée.
+
+## 9. Accès HTTPS à Grafana
+
+L'adresse prévue est :
+
+```text
 https://grafana.groupec.test:4443
+```
 
-Service interne :
-http://groupec-grafana:3000
+Le navigateur communique avec Traefik en HTTPS. Traefik transmet ensuite la requête à Grafana par HTTP sur le réseau Docker interne.
 
-Traefik assure le routage HTTPS.
+Sur notre VM QEMU, la page de connexion Grafana a déjà été atteinte à cette adresse.
 
-Grafana gère sa propre authentification.
+Lors de l'intégration finale, vérifier :
 
-Le middleware dashboard-auth est réservé
-au tableau de bord Traefik selon les
-informations communiquées par l'intégrateur.
+1. Que le nom grafana.groupec.test pointe vers l'adresse appropriée.
+2. Que le port HTTPS est accessible depuis le poste de test.
+3. Que Traefik transmet les requêtes à Grafana.
+4. Que la page de connexion apparaît.
+5. Que les identifiants administrateur permettent une connexion réussie.
 
-Le routage Grafana a été testé depuis
-Windows et depuis Ubuntu.
+Le certificat utilisé lors de nos essais était autosigné. Le navigateur peut donc afficher un avertissement de confiance.
 
-La page de connexion Grafana est accessible.
+L'accès à la page de connexion ne prouve pas, à lui seul, que l'authentification fonctionne.
 
-Le certificat observé dans Firefox était :
-TRAEFIK DEFAULT CERT
+### 9.1 Test d'accès HTTPS depuis Firefox sur Windows
 
-La configuration définitive du certificat
-et de la résolution DNS relève de
-l'intégration commune.
+Un test d'accès à Grafana a été effectué depuis le navigateur Firefox sur le poste Windows, en utilisant l'adresse :
 
-## 12. Vérifications techniques
+```text
+https://grafana.groupec.test:4443/login
+```
 
-Valider les fichiers Compose :
+Lors de ce test, Firefox a affiché un avertissement de sécurité concernant le certificat HTTPS, car celui-ci était autosigné et n'était pas reconnu comme fiable par le navigateur.
 
-docker compose -f /opt/GroupeC/loki/docker-compose.yml config --quiet
+La page de connexion Grafana a néanmoins pu être affichée.
 
-docker compose -f /opt/GroupeC/alloy/docker-compose.yml config --quiet
+Résultat : l'accès à la page de connexion Grafana par HTTPS via Traefik a été confirmé sur notre VM QEMU.
 
-docker compose -f /opt/GroupeC/grafana/docker-compose.yml config --quiet
+Limites du test :
 
-Vérifier les conteneurs :
-docker ps
+- Le certificat HTTPS n'était pas reconnu comme fiable par Firefox.
+- La connexion réussie au compte administrateur Grafana depuis Firefox n'a pas été confirmée.
+- L'accès HTTPS devra être vérifié de nouveau sur la VM commune lors de l'intégration finale.
 
-Vérifier les réseaux :
-docker network ls
+Ce test confirme l'accessibilité de la page Grafana via Traefik dans notre environnement QEMU, mais ne constitue pas une validation complète de l'authentification ni de la confiance du certificat HTTPS.
 
-Vérifier la disponibilité Loki depuis Grafana :
-docker exec groupec-grafana \
-  wget -S -O- http://groupec-loki:3100/ready 2>&1
+## 10. Stockage et conservation des journaux
 
-Résultat attendu :
-HTTP 200
-ready
+Loki utilise le volume persistant :
 
-Vérifier les étiquettes Loki :
-docker exec groupec-grafana \
-  wget -qO- http://groupec-loki:3100/loki/api/v1/labels
+```text
+loki_data
+```
 
-Des étiquettes observées lors des tests :
-filename
-job
-service_name
-stream
+Les données sont stockées sous /loki dans le conteneur.
 
-## 13. Résultats déjà validés
+La conservation est configurée à :
 
-Sur la VM de développement :
-- Grafana, Loki et Alloy ont démarré.
-- Les fichiers Compose Loki et Alloy sont valides.
-- Les montages Docker ont été vérifiés.
-- Grafana peut joindre Loki.
-- Loki a répondu HTTP 200 avec ready.
-- L'API Grafana a interrogé Loki avec succès.
-- Cinq messages ont été récupérés dans deux flux.
-- Des journaux d'Alloy et de Loki étaient présents.
-- L'accès HTTPS à Grafana depuis Windows fonctionne.
+```yaml
+limits_config:
+  retention_period: 168h
+```
 
-## 14. Points restant à vérifier
+Le compactor est activé pour appliquer cette rétention.
 
-- Reproduction complète sur une nouvelle VM.
-- Intégration au processus deploy.sh commun.
-- Création des réseaux et secrets dans le bon ordre.
-- Collecte effective des journaux des autres applications.
-- Configuration définitive du certificat HTTPS.
-- Résolution DNS sur les postes du groupe.
-- Consultation des journaux dans l'interface Grafana.
-- Tests de sauvegarde et de restauration des volumes.
-- Application effective de la rétention après 7 jours.
+La durée configurée est donc de sept jours.
 
-## 15. Conclusion
+Il faudra confirmer son application effective lors de la validation finale.
 
-Les fichiers Grafana, Loki et Alloy sont présents
-et ont été examinés sur la VM de développement.
+Le volume persistant ne remplace pas une sauvegarde indépendante.
 
-Les principaux tests fonctionnels sont réussis.
+## 11. Vérifications finales
 
-L'intégrateur dispose des dépendances,
-des configurations et des vérifications
-nécessaires pour préparer le déploiement commun.
+| Contrôle | Résultat attendu | État |
+| --- | --- | --- |
+| Réseau d'observabilité | Réseau présent | À vérifier sur la VM commune |
+| Loki | Conteneur actif | Déjà testé sur QEMU |
+| Alloy | Conteneur actif | Déjà testé sur QEMU |
+| Grafana | Conteneur actif | Déjà testé sur QEMU |
+| Secret Grafana | Fichier présent et lisible | Lecture validée sur QEMU |
+| Permissions du secret | Accès limité et fonctionnel | 640 validé sur QEMU |
+| Authentification Grafana | Connexion administrateur réussie | À confirmer |
+| Pilote Docker | json-file pour les conteneurs collectés | À confirmer |
+| Chemin des journaux | Compatible avec /journaux | À confirmer |
+| Permissions des journaux | Lecture possible par Alloy | À confirmer |
+| Alloy vers Loki | Journaux reçus | Déjà testé sur QEMU |
+| Grafana vers Loki | Consultation possible | Déjà testé sur QEMU |
+| Traefik vers Grafana | Résolution DNS et connexion au port 3000 | À confirmer sur la base commune |
+| HTTPS | Page accessible via Traefik | Déjà observé sur QEMU |
+| Rétention Loki | Conservation de sept jours appliquée | À confirmer |
 
-La reproductibilité complète reste à valider
-sur une nouvelle installation.
+## 12. Conclusion
+
+La contribution d'observabilité est constituée de trois services Docker indépendants : Grafana, Loki et Alloy.
+
+Les fichiers de configuration sont publiés sur la branche rolande.
+
+L'intégration doit conserver le réseau spécialisé GroupeC-observabilite, utiliser le secret Grafana généré par la base commune et préserver la route Traefik existante vers http://grafana:3000.
+
+Les essais effectués sur notre VM QEMU ont permis de valider plusieurs fonctions essentielles, notamment la collecte des journaux et leur consultation dans Grafana.
+
+Les vérifications restantes concernent principalement les différences possibles entre notre VM et la nouvelle base commune.
+
+Elles devront être réalisées par l'intégrateur avant de considérer l'observabilité comme entièrement opérationnelle sur la plateforme commune.
