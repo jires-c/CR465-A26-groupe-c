@@ -1,0 +1,192 @@
+# =============================================================================
+# CR465 - GroupeC
+# Portainer CE - Console graphique d'exploitation Docker Rootless
+# =============================================================================
+#
+# Objectifs :
+# - Fournir une interface graphique pour observer les conteneurs, réseaux,
+#   volumes, états et journaux.
+# - Utiliser le moteur Docker Rootless de l'utilisateur cr465.
+# - Ne publier AUCUN port Portainer directement sur l'hôte.
+# - Rendre Portainer accessible uniquement via Traefik.
+# - Rejoindre uniquement le réseau applicatif.
+# - Conserver les données Portainer dans un volume persistant.
+#
+# Prérequis :
+# - Docker Rootless opérationnel pour cr465.
+# - Variable XDG_RUNTIME_DIR disponible, par exemple :
+#       /run/user/1000
+# - Réseau Docker externe GroupeC-applicatif déjà créé.
+# - Secret présent :
+#       /opt/GroupeC/secrets/portainer_admin_password
+#
+# Accès :
+#       https://portainer.localhost:4443/
+#
+# Le routage HTTPS est réalisé par Traefik.
+# =============================================================================
+
+
+name: GroupeC-portainer
+
+
+services:
+
+  portainer:
+
+    # -------------------------------------------------------------------------
+    # Image
+    # -------------------------------------------------------------------------
+
+    # Version explicite afin d'éviter l'utilisation du tag "latest"
+    # et de faciliter la reproductibilité et les scans de sécurité.
+    image: portainer/portainer-ce:2.45.3
+
+    restart: unless-stopped
+
+
+    # -------------------------------------------------------------------------
+    # Connexion au moteur Docker Rootless
+    # -------------------------------------------------------------------------
+
+    # Portainer communique avec le socket Docker Rootless monté à l'intérieur
+    # du conteneur sous /var/run/docker.sock.
+    command:
+      - "-H"
+      - "unix:///var/run/docker.sock"
+
+      # Active le serveur HTTP interne de Portainer.
+      # Il n'est PAS directement publié sur l'hôte.
+      - "--http-enabled"
+
+      # Initialise le mot de passe administrateur depuis un fichier secret.
+      # Cette option est utilisée uniquement lors de la première initialisation
+      # de la base Portainer.
+      - "--admin-password-file"
+      - "/run/secrets/portainer_admin_password"
+
+
+    # -------------------------------------------------------------------------
+    # Sécurité à l'exécution
+    # -------------------------------------------------------------------------
+
+    security_opt:
+      - no-new-privileges:true
+
+    # Limitation des ressources de l'interface d'administration.
+    mem_limit: 512m
+
+    cpus: "1.0"
+
+    pids_limit: 256
+
+
+    # -------------------------------------------------------------------------
+    # Réseau / exposition
+    # -------------------------------------------------------------------------
+
+    # Le port 9000 est disponible UNIQUEMENT à l'intérieur des réseaux Docker.
+    #
+    # Il ne faut PAS utiliser :
+    #
+    # ports:
+    #   - "9000:9000"
+    #
+    # Traefik doit joindre directement :
+    #
+    # http://portainer:9000
+    #
+    expose:
+      - "9000"
+
+
+    # -------------------------------------------------------------------------
+    # Volumes
+    # -------------------------------------------------------------------------
+
+    volumes:
+
+      # Socket du moteur Docker Rootless de cr465.
+      #
+      # Exemple :
+      # XDG_RUNTIME_DIR=/run/user/1000
+      #
+      # Le socket réel devient :
+      # /run/user/1000/docker.sock
+      #
+      # Il est présenté à Portainer sous le chemin standard attendu :
+      # /var/run/docker.sock
+      #
+      # ATTENTION :
+      # le socket Docker donne à Portainer un contrôle important sur le moteur.
+      # Ce montage est donc réservé à Portainer car il est nécessaire à sa
+      # fonction d'administration.
+      - ${XDG_RUNTIME_DIR}/docker.sock:/var/run/docker.sock
+
+      # Stockage persistant de Portainer :
+      # utilisateurs, configuration, environnements, préférences, etc.
+      - portainer_data:/data
+
+
+    # -------------------------------------------------------------------------
+    # Secrets
+    # -------------------------------------------------------------------------
+
+    secrets:
+      - portainer_admin_password
+
+
+    # -------------------------------------------------------------------------
+    # Segmentation réseau
+    # -------------------------------------------------------------------------
+
+    # Portainer appartient UNIQUEMENT au réseau applicatif.
+    #
+    # Il ne rejoint pas :
+    # - GroupeC-exposition
+    # - GroupeC-donnees
+    #
+    # Il n'a aucune raison de communiquer avec PostgreSQL.
+    networks:
+      - applicatif
+
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+
+volumes:
+
+  portainer_data:
+
+    # Nom explicite afin de faciliter son identification dans Portainer
+    # et dans les commandes Docker.
+    name: GroupeC-portainer-data
+
+
+# =============================================================================
+# SECRETS
+# =============================================================================
+
+secrets:
+
+  portainer_admin_password:
+
+    # Le secret est généré localement sur la VM.
+    # Il ne doit jamais être stocké dans GitHub.
+    file: /opt/GroupeC/secrets/portainer_admin_password
+
+
+# =============================================================================
+# RÉSEAUX
+# =============================================================================
+
+networks:
+
+  applicatif:
+
+    # Ce réseau est créé par le provisioning général du projet.
+    # Ce fichier Compose ne doit donc pas créer son propre réseau isolé.
+    external: true
+
+    name: GroupeC-applicatif
