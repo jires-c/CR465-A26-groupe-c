@@ -1,8 +1,11 @@
 # GUIDE D'INTÉGRATION — OBSERVABILITÉ
 
 **Projet :** CR465 — Architecture sécurisée d'une plateforme pédagogique conteneurisée sur VM
+
 **Composants :** Grafana 12.3.0, Loki 3.5.5 et Alloy 1.10.2
+
 **Branche source :** rolande
+
 **Environnement cible :** Ubuntu 24.04, Docker Rootless, Docker Compose et Traefik
 
 ## 1. Objectif du guide
