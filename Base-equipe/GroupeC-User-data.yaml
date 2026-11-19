@@ -8,12 +8,14 @@
 #   - Traefik HTTPS local, redirection HTTP, dashboard protegee
 #   - Nginx WEBTEST temporaire via Traefik
 #   - PostgreSQL 17, 5 bases/logins (dont Opencast optionnel) et secrets aleatoires
+#   - Portainer CE sous Docker Rootless, HTTPS via Traefik et volume persistant
+#   - Route Grafana preparee (service Grafana non encore deploye)
 #   - Trois reseaux Docker dont donnees --internal
 #
 # NON INSTALLE DANS CETTE BASE:
-#   - Moodle, Keycloak, Drupal Commerce, n8n, Portainer CE (obligatoires)
+#   - Moodle, Keycloak, Drupal Commerce et n8n (obligatoires)
 #   - Opencast (optionnel), Redis et OpenAppSec (bonus), Grafana/Loki (facultatif)
-#   - Leurs emplacements write_files sont reserves COMMENTES.
+#   - Leurs emplacements write_files sont reserves COMMENTES. Portainer est actif.
 # NE PAS REUTILISER UNE VM CONTENANT DEJA UN VOLUME POSTGRESQL.
 # ============================================================================
 
@@ -189,7 +191,7 @@ write_files:
     permissions: "0644"
     content: |
       # TRAEFIK - fichier Compose reel (lance au premier boot)
-      # HTTP 8081, HTTPS 4443 et controle de sante 8080 sont lies a localhost.
+      # HTTP 8081 et ping 8080 restent lies a localhost; HTTPS 4443 sur les interfaces de la VM.
       # Pas de socket Docker monte: file provider pour reduire les privileges.
       name: GroupeC-traefik
       services:
@@ -219,10 +221,11 @@ write_files:
             - "--log.level=INFO"
             - "--accesslog=true"
           ports:
-            # Ports en mode labo: rien n est expose directement au LAN ou a Internet.
+            # Seul HTTPS 4443 peut etre accessible sur le reseau de la VM, sous controle UFW.
+            # Ne pas ouvrir 4443 a tous; autoriser une IP cliente lors des tests.
             - "127.0.0.1:8080:8080"
             - "127.0.0.1:8081:80"
-            - "127.0.0.1:4443:443"
+            - "4443:443"
           volumes:
             - /opt/GroupeC/traefik/dynamic:/dynamic:ro
             - /opt/GroupeC/traefik/certs:/certs:ro
@@ -263,8 +266,8 @@ write_files:
     permissions: "0644"
     content: |
       # TRAEFIK - routage HTTPS local. Aucun socket Docker n est monte.
-      # NOTE: les routes Moodle, Keycloak, Drupal, n8n et Portainer restent
-      # commentees JUSQU A installation reelle et test de chaque service.
+      # Portainer actif. Grafana: route reservee, app non deployee.
+      # Moodle, Keycloak, Drupal et n8n restent a integrer.
       http:
         routers:
           demo:
@@ -281,13 +284,24 @@ write_files:
             middlewares:
               - dashboard-auth
             tls: {}
+          portainer:
+            rule: "Host(`portainer.localhost`) || Host(`portainer.groupec.test`)"
+            entryPoints:
+              - websecure
+            service: portainer-service
+            tls: {}
+          # Route active dans Traefik, mais cible Grafana absente jusqu a integration par l equipe.
+          grafana:
+            rule: "Host(`grafana.groupec.test`)"
+            entryPoints:
+              - websecure
+            service: grafana-service
+            tls: {}
           # TODO MOODLE: ajouter router Host(`moodle.localhost`) et service moodle:80.
           # TODO KEYCLOAK: ajouter router Host(`keycloak.localhost`) et service keycloak:8080.
           # TODO DRUPAL: ajouter router Host(`drupal.localhost`) et service drupal:80.
           # TODO N8N: ne PAS exposer son interface admin sans controle d acces.
-          # TODO PORTAINER: ne PAS exposer sa console sans controle d acces.
           # TODO OPENCAST: si actif, route HTTPS vers le service video interne.
-          # TODO GRAFANA: si actif, route admin HTTPS ET controle d acces.
           # REDIS/LOKI: aucun routage public.
           # OPENAPPSEC: mode standalone local, integrer selon la doc WAF/Traefik.
         middlewares:
@@ -299,6 +313,14 @@ write_files:
             loadBalancer:
               servers:
                 - url: "http://webtest:80"
+          portainer-service:
+            loadBalancer:
+              servers:
+                - url: "http://portainer:9000"
+          grafana-service:
+            loadBalancer:
+              servers:
+                - url: "http://grafana:3000"
 
   # ------------------------------------------------------------------------
   # NGINX provisoire - test du reverse proxy HTTPS (non publie)
@@ -593,23 +615,198 @@ write_files:
     owner: root:root
     permissions: "0644"
     content: |
-      # PORTAINER - EMPLACEMENT A COMPLETER PAR LE MEMBRE RESPONSABLE.
-      # Mission : Interface exploitation et journaux.
-      # CE FICHIER EST INTENTIONNELLEMENT UN GABARIT COMMENTE ; NE PAS LE LANCER.
-      # Coller ici un vrai Docker Compose et retirer ces commentaires au besoin.
-      # Nom de service recommande : portainer.
-      # Traefik doit joindre ce service par GroupeC-applicatif, sans port hote public.
-      # Portainer utilise son stockage persistant propre et l API du Docker Rootless.
-      # IMPORTANT: ne pas publier son port de management sur Internet.
-      # Le socket rootless est privilegie; monter uniquement si indispensable.
-      # Reseaux EXTERNES a reutiliser, selon le besoin:
-      # networks:
-      #   applicatif:
-      #     external: true
-      #     name: GroupeC-applicatif
-      #   donnees:
-      #     external: true
-      #     name: GroupeC-donnees
+      # =============================================================================
+      # CR465 - GroupeC
+      # Portainer CE - Console graphique d'exploitation Docker Rootless
+      # =============================================================================
+      #
+      # Objectifs :
+      # - Fournir une interface graphique pour observer les conteneurs, réseaux,
+      #   volumes, états et journaux.
+      # - Utiliser le moteur Docker Rootless de l'utilisateur ubuntu.
+      # - Ne publier AUCUN port Portainer directement sur l'hôte.
+      # - Rendre Portainer accessible uniquement via Traefik.
+      # - Rejoindre uniquement le réseau applicatif.
+      # - Conserver les données Portainer dans un volume persistant.
+      #
+      # Prérequis :
+      # - Docker Rootless opérationnel pour ubuntu.
+      # - Variable XDG_RUNTIME_DIR disponible, par exemple :
+      #       /run/user/1000
+      # - Réseau Docker externe GroupeC-applicatif déjà créé.
+      # - Secret présent :
+      #       /opt/GroupeC/secrets/portainer_admin_password
+      #
+      # Accès :
+      #       https://portainer.localhost:4443/
+      #
+      # Le routage HTTPS est réalisé par Traefik.
+      # =============================================================================
+
+
+      name: GroupeC-portainer
+
+
+      services:
+
+        portainer:
+
+          # -------------------------------------------------------------------------
+          # Image
+          # -------------------------------------------------------------------------
+
+          # Version explicite afin d'éviter l'utilisation du tag "latest"
+          # et de faciliter la reproductibilité et les scans de sécurité.
+          image: portainer/portainer-ce:2.45.3
+
+          restart: unless-stopped
+
+
+          # -------------------------------------------------------------------------
+          # Connexion au moteur Docker Rootless
+          # -------------------------------------------------------------------------
+
+          # Portainer communique avec le socket Docker Rootless monté à l'intérieur
+          # du conteneur sous /var/run/docker.sock.
+          command:
+            - "-H"
+            - "unix:///var/run/docker.sock"
+
+            # Active le serveur HTTP interne de Portainer.
+            # Il n'est PAS directement publié sur l'hôte.
+            - "--http-enabled"
+
+            # Initialise le mot de passe administrateur depuis un fichier secret.
+            # Cette option est utilisée uniquement lors de la première initialisation
+            # de la base Portainer.
+            - "--admin-password-file"
+            - "/run/secrets/portainer_admin_password"
+
+
+          # -------------------------------------------------------------------------
+          # Sécurité à l'exécution
+          # -------------------------------------------------------------------------
+
+          security_opt:
+            - no-new-privileges:true
+
+          # Limitation des ressources de l'interface d'administration.
+          mem_limit: 512m
+
+          cpus: "1.0"
+
+          pids_limit: 256
+
+
+          # -------------------------------------------------------------------------
+          # Réseau / exposition
+          # -------------------------------------------------------------------------
+
+          # Le port 9000 est disponible UNIQUEMENT à l'intérieur des réseaux Docker.
+          #
+          # Il ne faut PAS utiliser :
+          #
+          # ports:
+          #   - "9000:9000"
+          #
+          # Traefik doit joindre directement :
+          #
+          # http://portainer:9000
+          #
+          expose:
+            - "9000"
+
+
+          # -------------------------------------------------------------------------
+          # Volumes
+          # -------------------------------------------------------------------------
+
+          volumes:
+
+            # Socket du moteur Docker Rootless de ubuntu.
+            #
+            # Exemple :
+            # XDG_RUNTIME_DIR=/run/user/1000
+            #
+            # Le socket réel devient :
+            # /run/user/1000/docker.sock
+            #
+            # Il est présenté à Portainer sous le chemin standard attendu :
+            # /var/run/docker.sock
+            #
+            # ATTENTION :
+            # le socket Docker donne à Portainer un contrôle important sur le moteur.
+            # Ce montage est donc réservé à Portainer car il est nécessaire à sa
+            # fonction d'administration.
+            - ${XDG_RUNTIME_DIR}/docker.sock:/var/run/docker.sock
+
+            # Stockage persistant de Portainer :
+            # utilisateurs, configuration, environnements, préférences, etc.
+            - portainer_data:/data
+
+
+          # -------------------------------------------------------------------------
+          # Secrets
+          # -------------------------------------------------------------------------
+
+          secrets:
+            - portainer_admin_password
+
+
+          # -------------------------------------------------------------------------
+          # Segmentation réseau
+          # -------------------------------------------------------------------------
+
+          # Portainer appartient UNIQUEMENT au réseau applicatif.
+          #
+          # Il ne rejoint pas :
+          # - GroupeC-exposition
+          # - GroupeC-donnees
+          #
+          # Il n'a aucune raison de communiquer avec PostgreSQL.
+          networks:
+            - applicatif
+
+
+      # =============================================================================
+      # VOLUMES
+      # =============================================================================
+
+      volumes:
+
+        portainer_data:
+
+          # Nom explicite afin de faciliter son identification dans Portainer
+          # et dans les commandes Docker.
+          name: GroupeC-portainer-data
+
+
+      # =============================================================================
+      # SECRETS
+      # =============================================================================
+
+      secrets:
+
+        portainer_admin_password:
+
+          # Le secret est généré localement sur la VM.
+          # Il ne doit jamais être stocké dans GitHub.
+          file: /opt/GroupeC/secrets/portainer_admin_password
+
+
+      # =============================================================================
+      # RÉSEAUX
+      # =============================================================================
+
+      networks:
+
+        applicatif:
+
+          # Ce réseau est créé par le provisioning général du projet.
+          # Ce fichier Compose ne doit donc pas créer son propre réseau isolé.
+          external: true
+
+          name: GroupeC-applicatif
 
   # ------------------------------------------------------------------------
   # SECTION OPTIONNELLE - OPENCAST (videos Moodle) : NON DEPLOYE
@@ -813,10 +1010,10 @@ write_files:
       done
 
       # Secrets generes SUR LA VM, jamais dans le YAML, .env, GitHub ou la video.
-      # Mots de passe SQL pour 5 services dont Opencast facultatif, plus dashboard/Redis/Grafana.
+      # Mots de passe SQL pour 5 services, plus dashboard/Portainer/Redis/Grafana.
       # Redis, Loki et Grafana ne requierent pas de base PostgreSQL dans ce projet.
       install -d -o ubuntu -g ubuntu -m 0700 "$ROOT/secrets"
-      for secret in postgres_admin_password moodle_db_password keycloak_db_password drupal_db_password n8n_db_password opencast_db_password traefik_dashboard_password redis_password grafana_admin_password; do
+      for secret in postgres_admin_password moodle_db_password keycloak_db_password drupal_db_password n8n_db_password opencast_db_password traefik_dashboard_password portainer_admin_password redis_password grafana_admin_password; do
         file="$ROOT/secrets/$secret"
         if [ ! -s "$file" ]; then
           ( umask 077; openssl rand -hex 32 > "$file" )
@@ -827,6 +1024,7 @@ write_files:
         chmod 0644 "$file"
       done
       chmod 0600 "$ROOT/secrets/traefik_dashboard_password"
+      chmod 0600 "$ROOT/secrets/portainer_admin_password"
 
       # Certificat autosigne HTTPS: local au laboratoire, 365 jours.
       # SAN explicites : curl ne fait pas correspondre *.localhost aux hotes locaux.
@@ -837,7 +1035,7 @@ write_files:
           -keyout "$ROOT/traefik/certs/local.key" \
           -out "$ROOT/traefik/certs/local.crt" \
           -subj '/CN=demo.localhost' \
-          -addext 'subjectAltName=DNS:localhost,DNS:demo.localhost,DNS:dashboard.localhost,IP:127.0.0.1' \
+          -addext 'subjectAltName=DNS:localhost,DNS:demo.localhost,DNS:dashboard.localhost,DNS:portainer.localhost,DNS:portainer.groupec.test,DNS:grafana.groupec.test,IP:127.0.0.1' \
           >/dev/null 2>&1
       fi
       chown ubuntu:ubuntu "$ROOT/traefik/certs/local.crt" "$ROOT/traefik/certs/local.key"
@@ -865,16 +1063,49 @@ write_files:
         echo 'ERREUR: reseau GroupeC-donnees non internal' >&2; exit 1;
       }
 
-      # La syntaxe des 3 vrais Compose est controlee avant execution.
-      for service in postgresql traefik webtest; do
+      # La syntaxe des 4 Compose fonctionnels est controlee avant execution.
+      for service in postgresql traefik webtest portainer; do
         user_docker compose -f "$ROOT/$service/docker-compose.yml" config --quiet
       done
 
-      # Le lancement des applications obligatoires/optionnelles est volontairement reporte.
-      # Les cinq gabarits sous /opt/GroupeC sont commentes et non operationnels.
+      # Les autres applications ne sont pas encore deployees.
+      # Les gabarits restent commentes; seule la console Portainer est ajoutee.
       user_docker compose -f "$ROOT/postgresql/docker-compose.yml" up -d
       user_docker compose -f "$ROOT/traefik/docker-compose.yml" up -d
       user_docker compose -f "$ROOT/webtest/docker-compose.yml" up -d
+      user_docker compose -f "$ROOT/portainer/docker-compose.yml" up -d
+
+      # Validation Portainer via Traefik: conteneur running et API HTTP 200.
+      portainer_ready=no
+      for i in $(seq 1 45); do
+        if user_docker compose -f "$ROOT/portainer/docker-compose.yml" ps --status running --services | grep -qx portainer; then
+          http_code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+            --cacert "$ROOT/traefik/certs/local.crt" \
+            --resolve portainer.localhost:4443:127.0.0.1 \
+            https://portainer.localhost:4443/api/system/status || true)"
+          if [ "$http_code" = 200 ]; then
+            portainer_ready=yes
+            break
+          fi
+        fi
+        sleep 2
+      done
+      [ "$portainer_ready" = yes ] || {
+        echo 'ERREUR: Portainer ou son routage HTTPS ne repond pas (HTTP 200 attendu)' >&2; exit 1;
+      }
+
+      # Portainer ne doit PAS publier de port hote ni rejoindre le reseau de donnees.
+      portainer_id="$(user_docker compose -f "$ROOT/portainer/docker-compose.yml" ps -q portainer)"
+      [ -n "$portainer_id" ] || { echo 'ERREUR: conteneur Portainer introuvable' >&2; exit 1; }
+      [ -z "$(user_docker port "$portainer_id")" ] || {
+        echo 'ERREUR: Portainer publie un port direct sur la VM' >&2; exit 1;
+      }
+      user_docker inspect -f '{{json .NetworkSettings.Networks}}' "$portainer_id" | grep -q GroupeC-applicatif || {
+        echo 'ERREUR: Portainer absent du reseau applicatif' >&2; exit 1;
+      }
+      if user_docker inspect -f '{{json .NetworkSettings.Networks}}' "$portainer_id" | grep -q GroupeC-donnees; then
+        echo 'ERREUR: Portainer ne doit pas rejoindre le reseau de donnees' >&2; exit 1;
+      fi
 
       # Attendre les cinq bases (Opencast optionnel compris) ET leurs proprietaires.
       ready=no
@@ -913,8 +1144,8 @@ write_files:
         echo 'ERREUR: validation Traefik HTTPS, ping ou dashboard protegee' >&2; exit 1;
       }
 
-      echo 'SUCCES: Docker Rootless, SSH, 3 reseaux, Traefik HTTPS, Nginx, PostgreSQL et 5 bases operationnels.'
-      echo 'NOTE: Moodle, Keycloak, Drupal, n8n et Portainer RESTENT A INTEGRER.'
+      echo 'SUCCES: Docker Rootless, SSH, reseaux, Traefik HTTPS, Nginx, PostgreSQL et Portainer CE valides.'
+      echo 'NOTE: Moodle, Keycloak, Drupal, n8n et Grafana restent a integrer.'
 
   # ------------------------------------------------------------------------
   # MODE D EMPLOI - collegues, reseaux, secrets, tests
@@ -936,13 +1167,15 @@ write_files:
       - Nginx TEMPORAIRE webtest pour prouver le routage HTTPS.
       - PostgreSQL 17, 5 bases et 5 comptes: moodle, keycloak, drupal, n8n, opencast.
       - Opencast reste non installe, mais son role/sa base sont provisionnes.
+      - Portainer CE: service actif via Traefik; administration Docker Rootless.
+      - Secret admin Portainer au premier demarrage, conserve localement dans /opt/GroupeC/secrets/.
       - Secret admin et secret distinct pour chaque compte SQL (PAS de valeur fixe).
       - Mots de passe reserves pour Redis et Grafana, sans activation des services.
-      - Les VRAIS conteneurs applicatifs ne sont PAS presents a ce stade.
+      - Moodle, Keycloak, Drupal, n8n et Grafana ne sont pas encore deployes.
 
       NOMS ET RESEAUX:
       - GroupeC-exposition : Traefik seulement.
-      - GroupeC-applicatif : Traefik, Nginx et futurs services web.
+      - GroupeC-applicatif : Traefik, Nginx, Portainer et futurs services web.
       - GroupeC-donnees : PostgreSQL et applications ayant une BD.
       - Les applications connectent a la BD via hote postgres:5432.
       - Portainer et Traefik ne necessitent pas de bases PostgreSQL.
@@ -954,13 +1187,13 @@ write_files:
       - /opt/GroupeC/keycloak/docker-compose.yml : ajouter vrai Compose + config Keycloak.
       - /opt/GroupeC/drupal/docker-compose.yml : ajouter vrai Compose + Commerce.
       - /opt/GroupeC/n8n/docker-compose.yml : ajouter vrai Compose + workflow.
-      - /opt/GroupeC/portainer/docker-compose.yml : ajouter vrai Compose Portainer.
+      - /opt/GroupeC/portainer/docker-compose.yml : Portainer CE fonctionnel (Compose fourni).
       - /opt/GroupeC/opencast/docker-compose.yml : OPTIONNEL, BDD opencast precree.
       - /opt/GroupeC/redis/docker-compose.yml : BONUS cache, secret redis_password.
       - /opt/GroupeC/grafana/docker-compose.yml : RECOMMANDE, mot de passe admin secret.
       - /opt/GroupeC/loki/docker-compose.yml : RECOMMANDE, stockage logs.
       - /opt/GroupeC/OpenAppsec/docker-compose.yml : BONUS +2 WAF standalone local.
-      - Leurs fichiers sont volontairement des gabarits commentes, non de deploys.
+      - Hormis Portainer, les autres applications sont des gabarits commentes non deployes.
       - Ajouter ensuite la route HTTPS correspondante dans /opt/GroupeC/traefik/dynamic/routes.yaml.
       - Pour chaque application qui a une base, joindre GroupeC-applicatif ET GroupeC-donnees.
       - Redis sur GroupeC-donnees uniquement. Loki/Grafana sur reseau partage sans port public.
@@ -971,19 +1204,30 @@ write_files:
         NE PAS copier ces fichiers sur GitHub ou dans le code.
       - Les moteurs applicatifs n acceptent pas tous *_PASSWORD_FILE.
         Adapter l image avec un point d entree ou mecanisme compatible.
-      - Le contenu des 4 bases n est initialise qu au PREMIER boot du volume PostgreSQL.
+      - Le contenu des 5 bases est initialise au PREMIER boot du volume PostgreSQL.
 
       ACCES DE LABORATOIRE (depuis la VM uniquement):
       - HTTP -> HTTPS: http://demo.localhost:8081/ -> https://demo.localhost:4443/
       - HTTPS demo: https://demo.localhost:4443/ (certificat local autosigne)
       - Traefik ping: http://127.0.0.1:8080/ping
       - Dashboard Traefik: https://dashboard.localhost:4443/dashboard/
+      - Portainer (dans la VM): https://portainer.localhost:4443/
+        Admin Portainer: mot de passe local /opt/GroupeC/secrets/portainer_admin_password
+        Le compte admin est initialise au premier demarrage seulement.
+      - Portainer (depuis Windows, si reseau/DNS/UFW configures):
+        https://portainer.groupec.test:4443/
+      - Grafana (route Traefik prete; service NON installe):
+        https://grafana.groupec.test:4443/
         Nom d utilisateur: admin
         Mot de passe sur la VM: /opt/GroupeC/secrets/traefik_dashboard_password
         Ce fichier est protege. Ne jamais publier le secret dans un rapport.
-      - Ports 8080 / 8081 / 4443 ecoutes sur 127.0.0.1 SEULEMENT.
-        Un collegue distant ne peut pas acceder directement a ces points d entree.
-      - Afin de servir de VRAIS utilisateurs, revoir exposition, DNS, TLS et controle d acces.
+      - Ping 8080 et HTTP 8081 ecoutes sur 127.0.0.1 seulement.
+      - HTTPS 4443 ecoute sur les interfaces VM; UFW doit limiter l acces aux IP autorisees.
+      - Pour le test Windows: associer portainer.groupec.test et grafana.groupec.test
+        a l IPv4 de la VM dans hosts/DNS, puis autoriser l IP du PC dans UFW.
+      - Exemple temporaire dans Ubuntu: sudo ufw allow from <IP_PC> to any port 4443 proto tcp
+      - Ne pas exposer ce laboratoire sur Internet. Certificat autosigne a approuver localement.
+      - Un collegue distant n a pas acces sans connectivite reseau (VPN/reseau VM).
 
       TESTS APRES PREMIER BOOT (dans Multipass):
         sudo cloud-init status --wait
@@ -996,6 +1240,9 @@ write_files:
         curl --noproxy '*' --cacert /opt/GroupeC/traefik/certs/local.crt \
           --resolve demo.localhost:4443:127.0.0.1 https://demo.localhost:4443/
         docker compose -f /opt/GroupeC/postgresql/docker-compose.yml ps
+        docker compose -f /opt/GroupeC/portainer/docker-compose.yml ps
+        curl --noproxy '*' --cacert /opt/GroupeC/traefik/certs/local.crt \
+          --resolve portainer.localhost:4443:127.0.0.1 https://portainer.localhost:4443/api/system/status
         docker compose -f /opt/GroupeC/postgresql/docker-compose.yml exec -T postgres \
           psql -U postgres -d postgres -c \
           "SELECT datname, pg_get_userbyid(datdba) AS owner FROM pg_database WHERE datname IN ('moodle','keycloak','drupal','n8n','opencast');"
