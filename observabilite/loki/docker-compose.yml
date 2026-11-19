@@ -1,0 +1,47 @@
+# LOKI - RECOMMANDE avec Grafana pour journalisation centralisee.
+# Loki est installe et configure pour la journalisation centralisee.
+# PAS de base PostgreSQL a creer: utiliser stockage local/fichiers ou
+# volume nomme pour index/journaux suivant la version Loki retenue.
+# Port HTTP interne usuel: 3100; ne pas publier vers Internet.
+# Exposer Loki seulement aux services qui le consultent / alimentent.
+# Grafana peut consulter Loki via http://groupec-loki:3100 (reseau partage).
+# Configurer une collecte reelle: Grafana Alloy, agent ou autre mecanisme
+# compatible; installer Loki seul NE collecte PAS automatiquement les logs.
+# Garder les interfaces de diagnostic Loki internes.
+# Exemple de reseau partage dans la topologie actuelle:
+# networks:
+#   applicatif:
+#     external: true
+#     name: GroupeC-applicatif
+# Prevoir politiques de retention, volume et limites ressources.
+
+# ==================================================
+# CONFIGURATION ACTIVE - LOKI
+# Responsable : observabilite GroupeC
+# ==================================================
+
+services:
+  loki:
+    image: grafana/loki:3.5.5
+    container_name: groupec-loki
+    restart: unless-stopped
+
+    command:
+      - -config.file=/etc/loki/loki-config.yaml
+
+    volumes:
+      - ./loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki_data:/loki
+
+    networks:
+      - observabilite
+
+    mem_limit: 768m
+
+volumes:
+  loki_data:
+
+networks:
+  observabilite:
+    external: true
+    name: GroupeC-observabilite

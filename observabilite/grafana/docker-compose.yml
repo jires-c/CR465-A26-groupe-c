@@ -1,0 +1,60 @@
+# GRAFANA - RECOMMANDE pour presenter les journaux et diagnostics.
+# EMPLACEMENT RESERVE : pas de service execute automatiquement.
+# Une installation de laboratoire peut utiliser un volume persistant
+# pour son stockage local SQLite; PAS besoin de PostgreSQL dans ce projet.
+# Secret admin reserve: /opt/GroupeC/secrets/grafana_admin_password.
+# Pour l image choisie: verifier prise en charge de __FILE / secrets;
+# ne pas saisir une valeur fixe dans le YAML.
+# Reseau: GroupeC-applicatif. Grafana doit pouvoir joindre Loki
+# sur un reseau Docker partage, sans rendre Loki public.
+# Port HTTP interne habituel: 3000; NE PAS faire "3000:3000" public.
+# Ajouter une route HTTPS limitee/protegee apres installation:
+#   Host(`grafana.groupec.test`) -> http://groupec-grafana:3000
+# Prevoir volume persistant Grafana, datasource Loki et authentification.
+# Tests: consultation logs, requete Loki, diagnostic d un incident fictif.
+# networks:
+#   applicatif:
+#     external: true
+#     name: GroupeC-applicatif
+
+# ==================================================
+# CONFIGURATION ACTIVE - GRAFANA
+# Projet CR465 - GroupeC
+# ==================================================
+
+services:
+  grafana:
+    image: grafana/grafana:12.3.0
+    container_name: groupec-grafana
+    restart: unless-stopped
+
+    user: "472:0"
+    group_add:
+      - "1000"
+
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - /opt/GroupeC/secrets/grafana_admin_password:/run/secrets/grafana_admin_password:ro
+
+    networks:
+      - applicatif
+      - observabilite
+
+    mem_limit: 512m
+
+volumes:
+  grafana_data:
+
+networks:
+  applicatif:
+    external: true
+    name: GroupeC-applicatif
+
+  observabilite:
+    external: true
+    name: GroupeC-observabilite
