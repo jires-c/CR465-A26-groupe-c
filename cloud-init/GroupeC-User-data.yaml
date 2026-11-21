@@ -1,6 +1,6 @@
 #cloud-config
 # ============================================================================
-# CR465 - GROUPEC : BASE COMMUNE RECONSTRUITE ET COMMENTEE
+# CR465 - GROUPEC : BASE COMMUNE + OBSERVABILITE INTEGREE
 # ============================================================================
 #
 # COUVERTURE FONCTIONNELLE DE CE FICHIER:
@@ -9,13 +9,13 @@
 #   - Nginx WEBTEST temporaire via Traefik
 #   - PostgreSQL 17, 5 bases/logins (dont Opencast optionnel) et secrets aleatoires
 #   - Portainer CE sous Docker Rootless, HTTPS via Traefik et volume persistant
-#   - Route Grafana preparee (service Grafana non encore deploye)
-#   - Trois reseaux Docker dont donnees --internal
+#   - Grafana 12.3.0, Loki 3.5.5, Alloy 1.10.2 : observabilite integree
+#   - Quatre reseaux Docker dont donnees et observabilite --internal
 #
 # NON INSTALLE DANS CETTE BASE:
 #   - Moodle, Keycloak, Drupal Commerce et n8n (obligatoires)
-#   - Opencast (optionnel), Redis et OpenAppSec (bonus), Grafana/Loki (facultatif)
-#   - Leurs emplacements write_files sont reserves COMMENTES. Portainer est actif.
+#   - Opencast (optionnel), Redis et OpenAppSec (bonus)
+#   - Leurs emplacements write_files sont reserves COMMENTES. Portainer/observabilite actifs.
 # NE PAS REUTILISER UNE VM CONTENANT DEJA UN VOLUME POSTGRESQL.
 # ============================================================================
 
@@ -51,7 +51,7 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /usr/local/sbin/prepare-docker-rootless.sh
     owner: root:root
-    permissions: "0755"
+    permissions: !!str "0755"
     content: |
       #!/usr/bin/env bash
       # EXPLICATION : Mode Bash strict : -e stoppe sur erreur, -u refuse les variables absentes, pipefail detecte les echecs dans les pipelines.
@@ -98,7 +98,7 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /usr/local/sbin/activate-docker-rootless.sh
     owner: root:root
-    permissions: "0755"
+    permissions: !!str "0755"
     content: |
       #!/usr/bin/env bash
       # EXPLICATION : Stoppe les erreurs plutot que de continuer avec une installation partiellement validee.
@@ -174,7 +174,7 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /etc/ssh/sshd_config.d/99-groupec.conf
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
       # SSH avec cles uniquement; aucun acces root par SSH.
       # Multipass installe normalement la cle de connexion dans ubuntu.
@@ -188,7 +188,7 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/traefik/docker-compose.yml
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
       # TRAEFIK - fichier Compose reel (lance au premier boot)
       # HTTP 8081 et ping 8080 restent lies a localhost; HTTPS 4443 sur les interfaces de la VM.
@@ -198,6 +198,11 @@ write_files:
         traefik:
           image: traefik:v3.5
           restart: unless-stopped
+          logging:
+            driver: "json-file"
+            options:
+              max-size: "10m"
+              max-file: "3"
           security_opt:
             - no-new-privileges:true
           read_only: true
@@ -246,7 +251,7 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/traefik/dynamic/tls.yaml
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
       # Certificat local autosigne genere automatiquement par deploy.sh.
       # Il n est PAS signe par une CA publique: navigateur = avertissement normal.
@@ -263,10 +268,10 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/traefik/dynamic/routes.yaml
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
       # TRAEFIK - routage HTTPS local. Aucun socket Docker n est monte.
-      # Portainer actif. Grafana: route reservee, app non deployee.
+      # Portainer et Grafana actifs; routage HTTPS depuis Traefik.
       # Moodle, Keycloak, Drupal et n8n restent a integrer.
       http:
         routers:
@@ -290,7 +295,7 @@ write_files:
               - websecure
             service: portainer-service
             tls: {}
-          # Route active dans Traefik, mais cible Grafana absente jusqu a integration par l equipe.
+          # La route Grafana utilise le service DNS "grafana" sur GroupeC-applicatif.
           grafana:
             rule: "Host(`grafana.groupec.test`)"
             entryPoints:
@@ -327,7 +332,7 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/webtest/docker-compose.yml
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
       # Service TEMPORAIRE pour prouver le routage de Traefik.
       # Supprimable lorsque les vraies applications sont disponibles.
@@ -341,6 +346,11 @@ write_files:
           image: nginx:1.28-alpine
           # EXPLICATION : Redemarre automatiquement Nginx avec Docker tant qu il n est pas arrete volontairement.
           restart: unless-stopped
+          logging:
+            driver: "json-file"
+            options:
+              max-size: "10m"
+              max-file: "3"
           # EXPLICATION : Applique des protections supplementaires au processus du conteneur.
           security_opt:
             # EXPLICATION : Empeche le gain de nouveaux privileges pour les processus Nginx.
@@ -364,7 +374,7 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/postgresql/docker-compose.yml
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
       # EXPLICATION : Projet Compose separe, dedie a la couche de donnees PostgreSQL.
       name: GroupeC-postgresql
@@ -376,6 +386,11 @@ write_files:
           image: postgres:17
           # EXPLICATION : Relance PostgreSQL au redemarrage, sauf si on l a arrete volontairement.
           restart: unless-stopped
+          logging:
+            driver: "json-file"
+            options:
+              max-size: "10m"
+              max-file: "3"
           # EXPLICATION : Variables lues par le script de demarrage de l image officielle PostgreSQL.
           environment:
             # EXPLICATION : Cree le superutilisateur PostgreSQL initial nomme postgres.
@@ -464,7 +479,7 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/postgresql/initdb/01-init-databases.sh
     owner: root:root
-    permissions: "0755"
+    permissions: !!str "0755"
     content: |
       #!/usr/bin/env bash
       # EXPLICATION : Arrete le script d initialisation si une commande, variable ou pipeline echoue.
@@ -510,7 +525,7 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/moodle/docker-compose.yml
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
       # MOODLE - EMPLACEMENT A COMPLETER PAR LE MEMBRE RESPONSABLE.
       # Mission : LMS principal.
@@ -535,7 +550,7 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/keycloak/docker-compose.yml
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
       # KEYCLOAK - EMPLACEMENT A COMPLETER PAR LE MEMBRE RESPONSABLE.
       # Mission : Fournisseur identite SSO.
@@ -561,7 +576,7 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/drupal/docker-compose.yml
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
       # DRUPAL - EMPLACEMENT A COMPLETER PAR LE MEMBRE RESPONSABLE.
       # Mission : Drupal Commerce et paiement fictif.
@@ -587,7 +602,7 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/n8n/docker-compose.yml
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
       # N8N - EMPLACEMENT A COMPLETER PAR LE MEMBRE RESPONSABLE.
       # Mission : Automatisation Drupal -> Moodle.
@@ -609,11 +624,11 @@ write_files:
       # Configurer un workflow demonstration vente Drupal -> acces Moodle.
 
   # ------------------------------------------------------------------------
-  # EMPLACEMENT RESERVE - PORTAINER obligatoire, NON deploye
+  # PORTAINER CE - INTEGRE ET DEPLOYE
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/portainer/docker-compose.yml
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
       # =============================================================================
       # CR465 - GroupeC
@@ -660,6 +675,11 @@ write_files:
           image: portainer/portainer-ce:2.45.3
 
           restart: unless-stopped
+          logging:
+            driver: "json-file"
+            options:
+              max-size: "10m"
+              max-file: "3"
 
 
           # -------------------------------------------------------------------------
@@ -813,7 +833,7 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/opencast/docker-compose.yml
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
       # OPENCAST - OPTIONNEL mais fortement souhaite dans l enonce.
       # EMPLACEMENT RESERVE : ce fichier est une aide d integration, pas un Compose actif.
@@ -847,7 +867,7 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/redis/docker-compose.yml
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
       # REDIS - BONUS (cache ou sessions selon compatibilite de l application).
       # EMPLACEMENT RESERVE : pas de conteneur lance depuis ce fichier.
@@ -866,61 +886,283 @@ write_files:
       # Pas de route Traefik: Redis n est pas une application HTTP publique.
 
   # ------------------------------------------------------------------------
-  # SECTION RECOMMANDEE - GRAFANA (interface observabilite) : NON DEPLOYE
+  # LOKI 3.5.5 : stockage centralise de journaux
   # ------------------------------------------------------------------------
-  - path: /opt/GroupeC/grafana/docker-compose.yml
+  - path: /opt/GroupeC/observabilite/loki/docker-compose.yml
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
-      # GRAFANA - RECOMMANDE pour presenter les journaux et diagnostics.
-      # EMPLACEMENT RESERVE : pas de service execute automatiquement.
-      # Une installation de laboratoire peut utiliser un volume persistant
-      # pour son stockage local SQLite; PAS besoin de PostgreSQL dans ce projet.
-      # Secret admin reserve: /opt/GroupeC/secrets/grafana_admin_password.
-      # Pour l image choisie: verifier prise en charge de __FILE / secrets;
-      # ne pas saisir une valeur fixe dans le YAML.
-      # Reseau: GroupeC-applicatif. Grafana doit pouvoir joindre Loki
-      # sur un reseau Docker partage, sans rendre Loki public.
-      # Port HTTP interne habituel: 3000; NE PAS faire "3000:3000" public.
-      # Ajouter une route HTTPS limitee/protegee apres installation:
-      #   Host(`grafana.localhost`) -> http://grafana:3000
-      # Prevoir volume persistant Grafana, datasource Loki et authentification.
-      # Tests: consultation logs, requete Loki, diagnostic d un incident fictif.
-      # networks:
-      #   applicatif:
-      #     external: true
-      #     name: GroupeC-applicatif
+      # ==================================================
+      # CONFIGURATION ACTIVE - LOKI
+      # Responsable : observabilite GroupeC
+      # ==================================================
+
+      name: GroupeC-loki
+
+      services:
+        loki:
+          image: grafana/loki:3.5.5
+          container_name: groupec-loki
+          restart: unless-stopped
+          security_opt:
+            - no-new-privileges:true
+          logging:
+            driver: "json-file"
+            options:
+              max-size: "10m"
+              max-file: "3"
+
+          command:
+            - -config.file=/etc/loki/loki-config.yaml
+
+          volumes:
+            - ./loki-config.yaml:/etc/loki/loki-config.yaml:ro
+            - loki_data:/loki
+
+          networks:
+            - observabilite
+
+          mem_limit: 768m
+
+      volumes:
+        loki_data:
+
+      networks:
+        observabilite:
+          external: true
+          name: GroupeC-observabilite
 
   # ------------------------------------------------------------------------
-  # SECTION RECOMMANDEE - LOKI (stockage logs) : NON DEPLOYE
+  # LOKI : configuration TSDB, retention 7 jours
   # ------------------------------------------------------------------------
-  - path: /opt/GroupeC/loki/docker-compose.yml
+  - path: /opt/GroupeC/observabilite/loki/loki-config.yaml
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
-      # LOKI - RECOMMANDE avec Grafana pour journalisation centralisee.
-      # EMPLACEMENT RESERVE : configuration Loki et Compose a ajouter.
-      # PAS de base PostgreSQL a creer: utiliser stockage local/fichiers ou
-      # volume nomme pour index/journaux suivant la version Loki retenue.
-      # Port HTTP interne usuel: 3100; ne pas publier vers Internet.
-      # Exposer Loki seulement aux services qui le consultent / alimentent.
-      # Grafana peut consulter Loki via http://loki:3100 (reseau partage).
-      # Configurer une collecte reelle: Grafana Alloy, agent ou autre mecanisme
-      # compatible; installer Loki seul NE collecte PAS automatiquement les logs.
-      # Garder les interfaces de diagnostic Loki internes.
-      # Exemple de reseau partage dans la topologie actuelle:
-      # networks:
-      #   applicatif:
-      #     external: true
-      #     name: GroupeC-applicatif
-      # Prevoir politiques de retention, volume et limites ressources.
+      auth_enabled: false
+
+      server:
+        http_listen_port: 3100
+
+      common:
+        instance_addr: 127.0.0.1
+        path_prefix: /loki
+        storage:
+          filesystem:
+            chunks_directory: /loki/chunks
+            rules_directory: /loki/rules
+        replication_factor: 1
+        ring:
+          kvstore:
+            store: inmemory
+
+      schema_config:
+        configs:
+          - from: "2024-01-01"
+            store: tsdb
+            object_store: filesystem
+            schema: v13
+            index:
+              prefix: index_
+              period: 24h
+
+      limits_config:
+        retention_period: 168h
+        allow_structured_metadata: true
+
+      compactor:
+        working_directory: /loki/compactor
+        retention_enabled: true
+        delete_request_store: filesystem
+
+  # ------------------------------------------------------------------------
+  # ALLOY 1.10.2 : lecture des journaux Docker Rootless
+  # ------------------------------------------------------------------------
+  - path: /opt/GroupeC/observabilite/alloy/docker-compose.yml
+    owner: root:root
+    permissions: !!str "0644"
+    content: |
+      name: GroupeC-alloy
+
+      services:
+        alloy:
+          image: grafana/alloy:v1.10.2
+          container_name: groupec-alloy
+          # UID 0 ici = utilisateur ubuntu de l'hote via Docker Rootless (PAS root de l'hote).
+          # Ce choix permet la lecture des journaux rootless en 0640; pas de mode privileged.
+          user: "0:0"
+          restart: unless-stopped
+          security_opt:
+            - no-new-privileges:true
+          logging:
+            driver: "json-file"
+            options:
+              max-size: "10m"
+              max-file: "3"
+
+          command:
+            - run
+            - /etc/alloy/config.alloy
+            - --storage.path=/var/lib/alloy/data
+
+          volumes:
+            - ./config.alloy:/etc/alloy/config.alloy:ro
+            - /home/ubuntu/.local/share/docker/containers:/journaux:ro
+            - alloy_data:/var/lib/alloy/data
+
+          networks:
+            - observabilite
+
+          mem_limit: 512m
+
+      volumes:
+        alloy_data:
+
+      networks:
+        observabilite:
+          external: true
+          name: GroupeC-observabilite
+
+  # ------------------------------------------------------------------------
+  # ALLOY : pipeline json-file vers Loki
+  # ------------------------------------------------------------------------
+  - path: /opt/GroupeC/observabilite/alloy/config.alloy
+    owner: root:root
+    permissions: !!str "0644"
+    content: |
+      local.file_match "docker_logs" {
+        path_targets = [
+          {
+            __path__ = "/journaux/*/*-json.log",
+            job      = "docker-rootless",
+          },
+        ]
+      }
+
+      loki.source.file "docker_logs" {
+        targets    = local.file_match.docker_logs.targets
+        forward_to = [loki.process.docker_json.receiver]
+      }
+
+      loki.process "docker_json" {
+        stage.json {
+          expressions = {
+            message = "log",
+            stream  = "stream",
+            time    = "time",
+          }
+        }
+
+        stage.timestamp {
+          source = "time"
+          format = "RFC3339Nano"
+        }
+
+        stage.output {
+          source = "message"
+        }
+
+        stage.labels {
+          values = {
+            stream = "",
+          }
+        }
+
+        forward_to = [loki.write.local.receiver]
+      }
+
+      loki.write "local" {
+        endpoint {
+          url = "http://groupec-loki:3100/loki/api/v1/push"
+        }
+      }
+
+  # ------------------------------------------------------------------------
+  # GRAFANA 12.3.0 : HTTPS via Traefik, secret local
+  # ------------------------------------------------------------------------
+  - path: /opt/GroupeC/observabilite/grafana/docker-compose.yml
+    owner: root:root
+    permissions: !!str "0644"
+    content: |
+      # ==================================================
+      # CONFIGURATION ACTIVE - GRAFANA
+      # Projet CR465 - GroupeC
+      # ==================================================
+
+      name: GroupeC-grafana
+
+      services:
+        grafana:
+          image: grafana/grafana:12.3.0
+          container_name: groupec-grafana
+          restart: unless-stopped
+          security_opt:
+            - no-new-privileges:true
+          logging:
+            driver: "json-file"
+            options:
+              max-size: "10m"
+              max-file: "3"
+
+          user: "472:0"
+          group_add:
+            - "1000"
+
+          environment:
+            GF_SECURITY_ADMIN_USER: admin
+            GF_SERVER_ROOT_URL: "https://grafana.groupec.test:4443/"
+            GF_SECURITY_COOKIE_SECURE: "true"
+            GF_AUTH_ANONYMOUS_ENABLED: "false"
+            GF_USERS_ALLOW_SIGN_UP: "false"
+            GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+
+          volumes:
+            - grafana_data:/var/lib/grafana
+            - ./provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+            - /opt/GroupeC/secrets/grafana_admin_password:/run/secrets/grafana_admin_password:ro
+
+          networks:
+            - applicatif
+            - observabilite
+
+          mem_limit: 512m
+
+      volumes:
+        grafana_data:
+
+      networks:
+        applicatif:
+          external: true
+          name: GroupeC-applicatif
+
+        observabilite:
+          external: true
+          name: GroupeC-observabilite
+
+  # ------------------------------------------------------------------------
+  # GRAFANA : datasource Loki configuree automatiquement
+  # ------------------------------------------------------------------------
+  - path: /opt/GroupeC/observabilite/grafana/provisioning/datasources/loki.yml
+    owner: root:root
+    permissions: !!str "0644"
+    content: |
+      apiVersion: 1
+
+      datasources:
+        - name: Loki
+          uid: loki
+          type: loki
+          access: proxy
+          url: http://groupec-loki:3100
+          isDefault: true
+          editable: false
 
   # ------------------------------------------------------------------------
   # SECTION BONUS +2 POINTS - OPENAPPSEC (WAF local) : NON DEPLOYE
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/OpenAppsec/docker-compose.yml
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
       # OPENAPPSEC - WAF BONUS +2 POINTS, mode LOCAL / STANDALONE exclusivement.
       # EMPLACEMENT RESERVE : PAS une installation fonctionnelle du WAF.
@@ -946,7 +1188,7 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/.env.example
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
       # Exemple partageable : aucune valeur secrete n est incluse.
       # Les mots de passe sont generes localement par /opt/GroupeC/deploy.sh.
@@ -971,7 +1213,7 @@ write_files:
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/deploy.sh
     owner: root:root
-    permissions: "0755"
+    permissions: !!str "0755"
     content: |
       #!/usr/bin/env bash
       # CR465 - Deploiement Rootless reproductible, base commune GroupeC.
@@ -1005,7 +1247,9 @@ write_files:
       # Toute la structure sous /opt/GroupeC (et non /opt/<service>).
       for folder in traefik traefik/dynamic traefik/certs traefik/auth \
         postgresql postgresql/initdb webtest moodle keycloak drupal n8n \
-        portainer opencast redis grafana loki OpenAppsec secrets; do
+        portainer opencast redis observabilite observabilite/loki observabilite/alloy \
+        observabilite/grafana observabilite/grafana/provisioning \
+        observabilite/grafana/provisioning/datasources OpenAppsec secrets; do
         install -d -m 0755 "$ROOT/$folder"
       done
 
@@ -1025,6 +1269,9 @@ write_files:
       done
       chmod 0600 "$ROOT/secrets/traefik_dashboard_password"
       chmod 0600 "$ROOT/secrets/portainer_admin_password"
+      # Compatible avec Grafana user 472:0 sous Docker Rootless : lecture via groupe 0.
+      # Verifier a nouveau par un test de lecture apres deploiement.
+      chmod 0640 "$ROOT/secrets/grafana_admin_password"
 
       # Certificat autosigne HTTPS: local au laboratoire, 365 jours.
       # SAN explicites : curl ne fait pas correspondre *.localhost aux hotes locaux.
@@ -1050,7 +1297,7 @@ write_files:
       chown ubuntu:ubuntu "$ROOT/traefik/auth/users.htpasswd"
       chmod 0600 "$ROOT/traefik/auth/users.htpasswd"
 
-      # 3 reseaux communs EXTERNES: separation des flux.
+      # 4 reseaux communs EXTERNES: separation des flux.
       for network in GroupeC-exposition GroupeC-applicatif; do
         if ! user_docker network inspect "$network" >/dev/null 2>&1; then
           user_docker network create --driver bridge "$network"
@@ -1062,14 +1309,30 @@ write_files:
       [ "$(user_docker network inspect GroupeC-donnees --format '{{.Internal}}')" = true ] || {
         echo 'ERREUR: reseau GroupeC-donnees non internal' >&2; exit 1;
       }
+      # Nouveau reseau reserve a Grafana/Loki/Alloy; Loki/Alloy non exposes sur l'hote.
+      if ! user_docker network inspect GroupeC-observabilite >/dev/null 2>&1; then
+        user_docker network create --driver bridge --internal GroupeC-observabilite
+      fi
+      [ "$(user_docker network inspect GroupeC-observabilite --format '{{.Internal}}')" = true ] || {
+        echo 'ERREUR: reseau GroupeC-observabilite non internal' >&2; exit 1;
+      }
+      # Empreinte du chemin exact valide sur la base Docker Rootless de ubuntu.
+      [ "$(user_docker info --format '{{.DockerRootDir}}')" = /home/ubuntu/.local/share/docker ] || {
+        echo 'ERREUR: DockerRootDir different du montage de journaux attendu par Alloy' >&2; exit 1;
+      }
+      # Ne pas modifier le repertoire des journaux gere par Docker.
 
-      # La syntaxe des 4 Compose fonctionnels est controlee avant execution.
+      # Verifier la configuration des 7 projets Compose avant demarrage.
       for service in postgresql traefik webtest portainer; do
         user_docker compose -f "$ROOT/$service/docker-compose.yml" config --quiet
       done
 
-      # Les autres applications ne sont pas encore deployees.
-      # Les gabarits restent commentes; seule la console Portainer est ajoutee.
+      for service in loki alloy grafana; do
+        user_docker compose -f "$ROOT/observabilite/$service/docker-compose.yml" config --quiet
+      done
+
+      # Moodle, Keycloak, Drupal et n8n ne sont pas encore deployes.
+      # Les gabarits applicatifs restent commentes; Portainer et observabilite ajoutes.
       user_docker compose -f "$ROOT/postgresql/docker-compose.yml" up -d
       user_docker compose -f "$ROOT/traefik/docker-compose.yml" up -d
       user_docker compose -f "$ROOT/webtest/docker-compose.yml" up -d
@@ -1144,15 +1407,73 @@ write_files:
         echo 'ERREUR: validation Traefik HTTPS, ping ou dashboard protegee' >&2; exit 1;
       }
 
-      echo 'SUCCES: Docker Rootless, SSH, reseaux, Traefik HTTPS, Nginx, PostgreSQL et Portainer CE valides.'
-      echo 'NOTE: Moodle, Keycloak, Drupal, n8n et Grafana restent a integrer.'
+      [ -d /home/ubuntu/.local/share/docker/containers ] || {
+        echo 'ERREUR: repertoire de journaux Rootless absent' >&2; exit 1;
+      }
+      # OBSERVABILITE : demarrer Loki et attendre sa disponibilite.
+      user_docker compose -f "$ROOT/observabilite/loki/docker-compose.yml" up -d
+
+      # Attendre HTTP 200 sur /ready avant de demarrer Alloy et Grafana.
+      # Loki reste accessible uniquement sur le reseau Docker interne.
+      if ! user_docker run --rm --network GroupeC-observabilite \
+          --entrypoint sh curlimages/curl:8.11.1 -c '
+            i=0
+            until curl --noproxy "*" -fsS -o /dev/null http://groupec-loki:3100/ready 2>/dev/null; do
+              i=$((i + 1))
+              if [ "$i" -ge 90 ]; then
+                echo "ERREUR: Loki non pret apres 180 secondes" >&2
+                exit 1
+              fi
+              sleep 2
+            done
+            echo "SUCCES: Loki est pret (HTTP 200 sur /ready)"
+          '; then
+        echo "ERREUR: Loki indisponible, deploiement interrompu" >&2
+        exit 1
+      fi
+
+      # Loki est pret : demarrer Alloy puis Grafana.
+      for service in alloy grafana; do
+        user_docker compose -f "$ROOT/observabilite/$service/docker-compose.yml" up -d
+      done
+
+      # Verifier que les trois conteneurs restent actifs (et non seulement "created").
+      for service in loki alloy grafana; do
+        container="groupec-$service"
+        running=no
+        for i in $(seq 1 45); do
+          if [ "$(user_docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)" = true ]; then
+            running=yes; break
+          fi
+          sleep 2
+        done
+        [ "$running" = yes ] || { echo "ERREUR: $container pas en cours d'execution" >&2; exit 1; }
+      done
+      # Acces a Grafana par Traefik en HTTPS (sans ouvrir le port 3000 de Grafana).
+      grafana_ready=no
+      for i in $(seq 1 90); do
+        code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+          --cacert "$ROOT/traefik/certs/local.crt" \
+          --resolve grafana.groupec.test:4443:127.0.0.1 \
+          https://grafana.groupec.test:4443/login || true)"
+        if [ "$code" = 200 ]; then grafana_ready=yes; break; fi
+        sleep 2
+      done
+      [ "$grafana_ready" = yes ] || {
+        echo 'ERREUR: page Grafana /login inaccessible via Traefik en HTTPS' >&2; exit 1;
+      }
+      # La verification d'acces aux fichiers par Alloy, de Loki et de la datasource
+      # Grafana demande un test de bout en bout APRES installation, voir README.
+      echo 'SUCCES: base Rootless/Traefik/PostgreSQL/Portainer validee; Loki, Alloy et Grafana demarres, Grafana HTTPS 200.'
+      echo 'A VERIFIER: lecture reelle des json-file par Alloy et requetes Grafana -> Loki.'
+      echo 'NOTE: Moodle, Keycloak, Drupal et n8n restent a integrer.'
 
   # ------------------------------------------------------------------------
   # MODE D EMPLOI - collegues, reseaux, secrets, tests
   # ------------------------------------------------------------------------
   - path: /opt/GroupeC/README-INTEGRATION.txt
     owner: root:root
-    permissions: "0644"
+    permissions: !!str "0644"
     content: |
       CR465 - BASE GROUPEC : FICHIER D INTEGRATION
       ==============================================
@@ -1161,7 +1482,7 @@ write_files:
       - SSH installe, authentification par cle (Multipass injecte sa cle).
       - Docker rootless (utilisateur ubuntu, demon systemd --user, linger).
       - Docker Compose.
-      - Reseaux: GroupeC-exposition; GroupeC-applicatif; GroupeC-donnees (internal).
+      - Reseaux: GroupeC-exposition; GroupeC-applicatif; GroupeC-donnees (internal); GroupeC-observabilite (internal).
       - Traefik HTTPS autosigne, file provider, aucun socket Docker monte.
       - Tableau de bord: route dashboard.localhost, authentification BasicAuth.
       - Nginx TEMPORAIRE webtest pour prouver le routage HTTPS.
@@ -1170,17 +1491,18 @@ write_files:
       - Portainer CE: service actif via Traefik; administration Docker Rootless.
       - Secret admin Portainer au premier demarrage, conserve localement dans /opt/GroupeC/secrets/.
       - Secret admin et secret distinct pour chaque compte SQL (PAS de valeur fixe).
-      - Mots de passe reserves pour Redis et Grafana, sans activation des services.
-      - Moodle, Keycloak, Drupal, n8n et Grafana ne sont pas encore deployes.
+      - Mot de passe Redis reserve; mot de passe Grafana actif par fichier secret.
+      - Moodle, Keycloak, Drupal et n8n ne sont pas encore deployes.
 
       NOMS ET RESEAUX:
       - GroupeC-exposition : Traefik seulement.
       - GroupeC-applicatif : Traefik, Nginx, Portainer et futurs services web.
       - GroupeC-donnees : PostgreSQL et applications ayant une BD.
+      - GroupeC-observabilite : Grafana, Loki et Alloy (internal).
       - Les applications connectent a la BD via hote postgres:5432.
       - Portainer et Traefik ne necessitent pas de bases PostgreSQL.
       - OpenAppSec WAF (+2 pts) et Redis sont BONUS; Opencast est OPTIONNEL.
-      - Grafana/Loki sont recommandes, mais non indispensables.
+      - Grafana/Loki/Alloy: couche observabilite active et a valider de bout en bout.
 
       CONFIGURATIONS COTE COLLEGUES:
       - /opt/GroupeC/moodle/docker-compose.yml : ajouter vrai Compose + config Moodle.
@@ -1190,10 +1512,13 @@ write_files:
       - /opt/GroupeC/portainer/docker-compose.yml : Portainer CE fonctionnel (Compose fourni).
       - /opt/GroupeC/opencast/docker-compose.yml : OPTIONNEL, BDD opencast precree.
       - /opt/GroupeC/redis/docker-compose.yml : BONUS cache, secret redis_password.
-      - /opt/GroupeC/grafana/docker-compose.yml : RECOMMANDE, mot de passe admin secret.
-      - /opt/GroupeC/loki/docker-compose.yml : RECOMMANDE, stockage logs.
+      - /opt/GroupeC/observabilite/grafana/docker-compose.yml : ACTIF, HTTPS par Traefik.
+      - /opt/GroupeC/observabilite/loki/docker-compose.yml : ACTIF, stockage des logs.
+      - /opt/GroupeC/observabilite/alloy/docker-compose.yml : ACTIF, collecte des logs JSON.
+      - /opt/GroupeC/observabilite/grafana/provisioning/datasources/loki.yml : source Loki.
+      - /opt/GroupeC/observabilite/alloy/config.alloy : pipeline Docker -> Loki.
       - /opt/GroupeC/OpenAppsec/docker-compose.yml : BONUS +2 WAF standalone local.
-      - Hormis Portainer, les autres applications sont des gabarits commentes non deployes.
+      - Sont deployes: Traefik, Nginx temporaire, PostgreSQL, Portainer, Loki, Alloy, Grafana.
       - Ajouter ensuite la route HTTPS correspondante dans /opt/GroupeC/traefik/dynamic/routes.yaml.
       - Pour chaque application qui a une base, joindre GroupeC-applicatif ET GroupeC-donnees.
       - Redis sur GroupeC-donnees uniquement. Loki/Grafana sur reseau partage sans port public.
@@ -1216,10 +1541,10 @@ write_files:
         Le compte admin est initialise au premier demarrage seulement.
       - Portainer (depuis Windows, si reseau/DNS/UFW configures):
         https://portainer.groupec.test:4443/
-      - Grafana (route Traefik prete; service NON installe):
+      - Grafana (service integre; authentification a verifier):
         https://grafana.groupec.test:4443/
         Nom d utilisateur: admin
-        Mot de passe sur la VM: /opt/GroupeC/secrets/traefik_dashboard_password
+        Mot de passe sur la VM: /opt/GroupeC/secrets/grafana_admin_password
         Ce fichier est protege. Ne jamais publier le secret dans un rapport.
       - Ping 8080 et HTTP 8081 ecoutes sur 127.0.0.1 seulement.
       - HTTPS 4443 ecoute sur les interfaces VM; UFW doit limiter l acces aux IP autorisees.
@@ -1241,6 +1566,16 @@ write_files:
           --resolve demo.localhost:4443:127.0.0.1 https://demo.localhost:4443/
         docker compose -f /opt/GroupeC/postgresql/docker-compose.yml ps
         docker compose -f /opt/GroupeC/portainer/docker-compose.yml ps
+        docker compose -f /opt/GroupeC/observabilite/loki/docker-compose.yml ps
+        docker compose -f /opt/GroupeC/observabilite/alloy/docker-compose.yml ps
+        docker compose -f /opt/GroupeC/observabilite/grafana/docker-compose.yml ps
+        docker network inspect GroupeC-observabilite --format '{{.Internal}}'
+        docker info --format '{{.LoggingDriver}}'
+        docker logs --tail 50 groupec-alloy
+        docker logs --tail 50 groupec-loki
+        curl --noproxy '*' --cacert /opt/GroupeC/traefik/certs/local.crt \
+          --resolve grafana.groupec.test:4443:127.0.0.1 https://grafana.groupec.test:4443/login
+        # Puis se connecter a Grafana et verifier une requete LogQL de collecte reelle.
         curl --noproxy '*' --cacert /opt/GroupeC/traefik/certs/local.crt \
           --resolve portainer.localhost:4443:127.0.0.1 https://portainer.localhost:4443/api/system/status
         docker compose -f /opt/GroupeC/postgresql/docker-compose.yml exec -T postgres \
@@ -1263,7 +1598,7 @@ runcmd:
   - [bash, /usr/local/sbin/prepare-docker-rootless.sh]
   # 2) Docker Rootless comme service systemd --user avec linger et controle.
   - [bash, /usr/local/sbin/activate-docker-rootless.sh]
-  # 3) Secrets, certificats, 3 reseaux, Traefik HTTPS, Nginx et PostgreSQL.
+  # 3) Secrets, certificats, 4 reseaux, base et observabilite Loki/Alloy/Grafana.
   - [bash, /opt/GroupeC/deploy.sh]
 
-final_message: 'CR465 GroupeC : cloud-init termine ; verifier les services avec sudo cloud-init status --wait et docker ps.'
+final_message: 'CR465 GroupeC : cloud-init termine ; verifier Rootless, les 7 conteneurs et la collecte Grafana/Loki.'
