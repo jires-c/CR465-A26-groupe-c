@@ -298,7 +298,12 @@ write_files:
             service: grafana-service
             tls: {}
           # TODO MOODLE: ajouter router Host(`moodle.localhost`) et service moodle:80.
-          # TODO KEYCLOAK: ajouter router Host(`keycloak.localhost`) et service keycloak:8080.
+          keycloak:
+            rule: "Host(`keycloak.localhost`)"
+            entryPoints:
+              - websecure
+            service: keycloak-service
+            tls: {}
           # TODO DRUPAL: ajouter router Host(`drupal.localhost`) et service drupal:80.
           # TODO N8N: ne PAS exposer son interface admin sans controle d acces.
           # TODO OPENCAST: si actif, route HTTPS vers le service video interne.
@@ -321,6 +326,10 @@ write_files:
             loadBalancer:
               servers:
                 - url: "http://grafana:3000"
+          keycloak-service:
+            loadBalancer:
+              servers:
+                - url: "http://keycloak:8080"
 
   # ------------------------------------------------------------------------
   # NGINX provisoire - test du reverse proxy HTTPS (non publie)
@@ -537,24 +546,49 @@ write_files:
     owner: root:root
     permissions: "0644"
     content: |
-      # KEYCLOAK - EMPLACEMENT A COMPLETER PAR LE MEMBRE RESPONSABLE.
-      # Mission : Fournisseur identite SSO.
-      # CE FICHIER EST INTENTIONNELLEMENT UN GABARIT COMMENTE ; NE PAS LE LANCER.
-      # Coller ici un vrai Docker Compose et retirer ces commentaires au besoin.
-      # Nom de service recommande : keycloak.
-      # Traefik doit joindre ce service par GroupeC-applicatif, sans port hote public.
-      # PostgreSQL: hote "postgres", port 5432, base "keycloak", role "keycloak".
-      # Secret: /opt/GroupeC/secrets/keycloak_db_password (valeur generee par deploy.sh).
-      # Le service doit appartenir aux DEUX reseaux GroupeC-applicatif et GroupeC-donnees.
-      # Reseaux EXTERNES a reutiliser, selon le besoin:
-      # networks:
-      #   applicatif:
-      #     external: true
-      #     name: GroupeC-applicatif
-      #   donnees:
-      #     external: true
-      #     name: GroupeC-donnees
-      # Configurer OIDC / SSO Keycloak -> Moodle APRES la mise en service.
+      name: groupec-keycloak
+
+      services:
+        keycloak:
+          image: quay.io/keycloak/keycloak:26.8.2
+          restart: unless-stopped
+
+          command:
+            - start
+          environment:
+            KC_DB: postgres
+            KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+            KC_DB_USERNAME: keycloak
+            KC_DB_PASSWORD: ${KC_DB_PASSWORD:?DB password required}
+
+            KC_BOOTSTRAP_ADMIN_USERNAME: admin
+            KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_BOOTSTRAP_ADMIN_PASSWORD:?Admin password required}
+
+            KC_HTTP_ENABLED: "true"
+            KC_HOSTNAME: https://keycloak.localhost:4443
+            KC_PROXY_HEADERS: xforwarded
+
+          networks:
+            - applicatif
+            - donnees
+
+          secrets:
+            - keycloak_db_password
+            - keycloak_admin_password
+
+      networks:
+        applicatif:
+          external: true
+          name: GroupeC-applicatif
+        donnees:
+          external: true
+          name: GroupeC-donnees
+
+      secrets:
+        keycloak_db_password:
+          file: /opt/GroupeC/secrets/keycloak_db_password
+        keycloak_admin_password:
+          file: /opt/GroupeC/secrets/keycloak_admin_password
 
   # ------------------------------------------------------------------------
   # EMPLACEMENT RESERVE - DRUPAL obligatoire, NON deploye
@@ -1013,7 +1047,7 @@ write_files:
       # Mots de passe SQL pour 5 services, plus dashboard/Portainer/Redis/Grafana.
       # Redis, Loki et Grafana ne requierent pas de base PostgreSQL dans ce projet.
       install -d -o ubuntu -g ubuntu -m 0700 "$ROOT/secrets"
-      for secret in postgres_admin_password moodle_db_password keycloak_db_password drupal_db_password n8n_db_password opencast_db_password traefik_dashboard_password portainer_admin_password redis_password grafana_admin_password; do
+      for secret in postgres_admin_password moodle_db_password keycloak_db_password keycloak_admin_password drupal_db_password n8n_db_password opencast_db_password traefik_dashboard_password portainer_admin_password redis_password grafana_admin_password; do
         file="$ROOT/secrets/$secret"
         if [ ! -s "$file" ]; then
           ( umask 077; openssl rand -hex 32 > "$file" )
@@ -1025,6 +1059,7 @@ write_files:
       done
       chmod 0600 "$ROOT/secrets/traefik_dashboard_password"
       chmod 0600 "$ROOT/secrets/portainer_admin_password"
+      chmod 0600 "$ROOT/secrets/keycloak_admin_password"
 
       # Certificat autosigne HTTPS: local au laboratoire, 365 jours.
       # SAN explicites : curl ne fait pas correspondre *.localhost aux hotes locaux.
@@ -1035,7 +1070,7 @@ write_files:
           -keyout "$ROOT/traefik/certs/local.key" \
           -out "$ROOT/traefik/certs/local.crt" \
           -subj '/CN=demo.localhost' \
-          -addext 'subjectAltName=DNS:localhost,DNS:demo.localhost,DNS:dashboard.localhost,DNS:portainer.localhost,DNS:portainer.groupec.test,DNS:grafana.groupec.test,IP:127.0.0.1' \
+          -addext 'subjectAltName=DNS:localhost,DNS:demo.localhost,DNS:dashboard.localhost,DNS:portainer.localhost,DNS:portainer.groupec.test,DNS:grafana.groupec.test,DNS:keycloak.localhost,IP:127.0.0.1' \
           >/dev/null 2>&1
       fi
       chown ubuntu:ubuntu "$ROOT/traefik/certs/local.crt" "$ROOT/traefik/certs/local.key"
@@ -1123,6 +1158,12 @@ write_files:
         psql -U postgres -d postgres -tAc \
         "SELECT count(*) FROM pg_database WHERE datname IN ('moodle','keycloak','drupal','n8n','opencast') AND datname=pg_get_userbyid(datdba)" 2>/dev/null || true)"
       [ "$correct_owners" = 5 ] || { echo 'ERREUR: proprietaires des bases non conformes' >&2; exit 1; }
+      # Demarrer Keycloak apres validation de PostgreSQL.
+      export KC_DB_PASSWORD="$(cat "$ROOT/secrets/keycloak_db_password")"
+      export KC_BOOTSTRAP_ADMIN_PASSWORD="$(cat "$ROOT/secrets/keycloak_admin_password")"
+      user_docker compose -f "$ROOT/keycloak/docker-compose.yml" config --quiet
+      user_docker compose -f "$ROOT/keycloak/docker-compose.yml" up -d
+      unset KC_DB_PASSWORD KC_BOOTSTRAP_ADMIN_PASSWORD
 
       # 1) Ping Traefik; 2) HTTPS Nginx; 3) dashboard refuse les anonymes.
       # --resolve evite de dependre de la resolution .localhost dans la VM.
