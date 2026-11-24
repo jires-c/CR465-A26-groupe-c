@@ -1,0 +1,2912 @@
+#cloud-config
+# ============================================================================
+# CR465 - GROUPEC : BASE COMMUNE + OBSERVABILITE INTEGREE
+# V3 : correctif TLS Keycloak V2 + permissions write_files explicites (!!str).
+# ============================================================================
+#
+# COUVERTURE FONCTIONNELLE DE CE FICHIER:
+#   - Ubuntu 24.04, SSH par cle, UFW et Docker Engine Rootless
+#   - Traefik HTTPS local, redirection HTTP, dashboard protegee
+#   - Nginx WEBTEST temporaire via Traefik
+#   - PostgreSQL 17, 5 bases/logins (dont Opencast optionnel) et secrets aleatoires
+#   - Portainer CE sous Docker Rootless, HTTPS via Traefik et volume persistant
+#   - Grafana 12.3.0, Loki 3.5.5, Alloy 1.10.2 : observabilite integree
+#   - Quatre reseaux Docker dont donnees et observabilite --internal
+#
+# NON INSTALLE DANS CETTE BASE:
+#   - Drupal Commerce et n8n (obligatoires); Moodle / Keycloak sont integres
+#   - Opencast (optionnel), Redis et OpenAppSec (bonus)
+#   - Leurs emplacements write_files sont reserves COMMENTES. Portainer/observabilite actifs.
+# NE PAS REUTILISER UNE VM CONTENANT DEJA UN VOLUME POSTGRESQL.
+# ============================================================================
+
+# Installation non interactive sur une VM Ubuntu 24.04 fraiche.
+package_update: true
+package_upgrade: true
+# L utilisateur admin "ubuntu" est celui fourni par Multipass.
+users:
+- default
+# Aucun mot de passe SSH; Multipass gere la cle publique de connexion.
+ssh_pwauth: false
+disable_root: true
+packages:
+- ca-certificates
+- curl
+- git
+- jq
+- uidmap
+- dbus-user-session
+- slirp4netns
+- fuse-overlayfs
+- ufw
+- openssl
+- openssh-server
+- apache2-utils
+
+# ==========================================================================
+# WRITE_FILES : tous les fichiers sont crees AVANT les commandes runcmd.
+# ==========================================================================
+- python3
+write_files:
+  # ------------------------------------------------------------------------
+  # ETAPE 1 - preparation Docker Engine + SSH + pare-feu
+  # ------------------------------------------------------------------------
+- path: /usr/local/sbin/prepare-docker-rootless.sh
+  owner: root:root
+  permissions: !!str "0755"
+  content: |
+    #!/usr/bin/env bash
+    # EXPLICATION : Mode Bash strict : -e stoppe sur erreur, -u refuse les variables absentes, pipefail detecte les echecs dans les pipelines.
+    set -euo pipefail
+    # EXPLICATION : Evite qu apt affiche une question interactive lors de l installation automatisee.
+    export DEBIAN_FRONTEND=noninteractive
+
+    # Installer le moteur Docker et le plugin Compose depuis le depot officiel.
+    # EXPLICATION : Cree le repertoire des cles APT avec des permissions de lecture standard (0755).
+    install -m 0755 -d /etc/apt/keyrings
+    # EXPLICATION : Recupere la cle GPG du depot officiel Docker pour verifier les paquets.
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    # EXPLICATION : Donne aux processus APT le droit de lire cette cle.
+    chmod a+r /etc/apt/keyrings/docker.asc
+    # EXPLICATION : Ecrit le fichier de depot APT Docker. SOURCES termine le bloc multilignes Bash.
+    cat > /etc/apt/sources.list.d/docker.sources <<SOURCES
+    Types: deb
+    URIs: https://download.docker.com/linux/ubuntu
+    Suites: noble
+    Components: stable
+    Architectures: $(dpkg --print-architecture)
+    Signed-By: /etc/apt/keyrings/docker.asc
+    SOURCES
+    # EXPLICATION : Recharge les listes des paquets maintenant que le depot Docker a ete ajoute.
+    apt-get update
+    # EXPLICATION : Installe le moteur Docker, son client CLI, containerd, Buildx, Compose et les outils Rootless. -y confirme automatiquement.
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras
+
+    # Eviter tout demon Docker privilegie en parallele.
+    # EXPLICATION : Desactive et arrete le daemon et le socket Docker privilegies ; le daemon utilisateur sera installe ensuite.
+    systemctl disable --now docker.service docker.socket
+    # EXPLICATION : Supprime un eventuel socket systeme residuel (-f ignore son absence), sans toucher au futur socket Rootless.
+    rm -f /run/docker.sock
+
+    # Garder SSH autorise sur la VM laboratoire, aucun port applicatif public.
+    # EXPLICATION : Prevoit une exception SSH TCP/22 avant d activer le pare-feu pour eviter de bloquer cette administration.
+    systemctl enable --now ssh
+    ufw allow 22/tcp
+    # Acces HTTPS Traefik pour le labo. Avec VirtualBox NAT, publication Windows
+    # uniquement sur 127.0.0.1:4443 via la regle natpf1 cote hote.
+    ufw allow 4443/tcp
+    # EXPLICATION : Active UFW sans demander confirmation ; les ports applicatifs ne sont pas ouverts ici.
+    ufw --force enable
+
+  # ------------------------------------------------------------------------
+  # ETAPE 2 - activation et validation du demon Docker ROOTLESS
+  # ------------------------------------------------------------------------
+- path: /usr/local/sbin/activate-docker-rootless.sh
+  owner: root:root
+  permissions: !!str "0755"
+  content: |
+    #!/usr/bin/env bash
+    # EXPLICATION : Stoppe les erreurs plutot que de continuer avec une installation partiellement validee.
+    set -euo pipefail
+
+    # Reprend la procedure rootless deja validee dans le projet.
+    # EXPLICATION : Compte Linux NON root qui possedera et executera le moteur Docker.
+    DOCKER_USER=ubuntu
+    # EXPLICATION : Calcule son UID numerique (habituellement 1000, sans supposer que cette valeur est fixe).
+    USER_ID="$(id -u "$DOCKER_USER")"
+    # EXPLICATION : Repertoire runtime systemd de cet utilisateur ; contient le socket du daemon Rootless.
+    RUNTIME_DIR="/run/user/${USER_ID}"
+    # EXPLICATION : Adresse D-Bus utilisee pour communiquer avec le gestionnaire systemd de l utilisateur.
+    BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
+
+    # Docker Rootless requiert au moins 65536 UID/GID subordonnes.
+    # EXPLICATION : Verifie les plages d identifiants utilisateurs et groupes subordonnes requises par les user namespaces Rootless.
+    for file in /etc/subuid /etc/subgid; do
+      # EXPLICATION : awk lit les champs separes par deux-points et exige >=65536 UID/GID subordonnes pour ubuntu.
+      if ! awk -F: '$1 == "ubuntu" && $3 >= 65536 {ok=1} END{exit !ok}' "$file"; then
+        echo "ERREUR: plage UID/GID insuffisante dans $file" >&2
+        exit 1
+      fi
+    done
+
+    # EXPLICATION : Conserve le gestionnaire systemd de ubuntu actif meme lorsqu aucune session SSH n est ouverte.
+    loginctl enable-linger "$DOCKER_USER"
+    # EXPLICATION : Lance le gestionnaire systemd --user associe a cet UID.
+    systemctl start "user@${USER_ID}.service"
+    # EXPLICATION : Attend au plus 30 iterations la creation du bus D-Bus utilisateur, plutot que de supposer un demarrage instantane.
+    for i in $(seq 1 30); do
+      [ -S "${RUNTIME_DIR}/bus" ] && break
+      sleep 1
+    done
+    # EXPLICATION : Verifie que le chemin est bien un socket (-S) ; arrete si le bus n est jamais apparu.
+    [ -S "${RUNTIME_DIR}/bus" ] || { echo 'ERREUR: bus systemd absent' >&2; exit 1; }
+
+    # EXPLICATION : Fonction reutilisable : execute une commande comme ubuntu, avec HOME, variables systemd et PATH corrects.
+    user_cmd() {
+      runuser -u "$DOCKER_USER" -- env \
+        HOME="/home/${DOCKER_USER}" USER="$DOCKER_USER" LOGNAME="$DOCKER_USER" \
+        XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+        DBUS_SESSION_BUS_ADDRESS="$BUS_ADDRESS" \
+        PATH="/usr/local/bin:/usr/bin:/bin" "$@"
+    }
+
+    # EXPLICATION : Installe et configure le service Docker Rootless pour ubuntu, PAS pour root.
+    user_cmd dockerd-rootless-setuptool.sh install
+    # EXPLICATION : Active Docker au demarrage du gestionnaire utilisateur et le lance immediatement.
+    user_cmd systemctl --user enable --now docker.service
+    # EXPLICATION : Selectionne le contexte Docker CLI pointant vers le daemon Rootless.
+    user_cmd docker context use rootless
+
+    # EXPLICATION : Drapeau de verification ; reste "no" jusqu a ce que le daemon confirme le mode rootless.
+    verified=no
+    # EXPLICATION : Attend au plus 30 iterations la creation du bus D-Bus utilisateur, plutot que de supposer un demarrage instantane.
+    for i in $(seq 1 30); do
+      # EXPLICATION : Interroge les options de securite de Docker ; grep recherche "rootless". stderr est masque pendant l attente.
+      if user_cmd docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -q rootless; then
+        verified=yes
+        break
+      fi
+      sleep 2
+    done
+    # EXPLICATION : Refuse de poursuivre l installation si le daemon n a pas ete valide.
+    [ "$verified" = yes ] || { echo 'ERREUR: Docker Rootless non operationnel' >&2; exit 1; }
+    echo 'SUCCES: Docker Rootless installe et actif sous ubuntu'
+    # EXPLICATION : Affiche les options finales comme preuve technique dans les journaux cloud-init.
+    user_cmd docker info --format '{{json .SecurityOptions}}'
+
+  # ------------------------------------------------------------------------
+  # SSH : configuration de l acces administrateur sans mot de passe
+  # ------------------------------------------------------------------------
+- path: /etc/ssh/sshd_config.d/99-groupec.conf
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # SSH avec cles uniquement; aucun acces root par SSH.
+    # Multipass installe normalement la cle de connexion dans ubuntu.
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    PermitRootLogin no
+    PubkeyAuthentication yes
+
+  # ------------------------------------------------------------------------
+  # TRAEFIK - Compose avec HTTPS, dashboard protege et file provider
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/traefik/docker-compose.yml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # TRAEFIK - fichier Compose reel (lance au premier boot)
+    # HTTP 8081 et ping 8080 restent lies a localhost; HTTPS 4443 sur les interfaces de la VM.
+    # Pas de socket Docker monte: file provider pour reduire les privileges.
+    name: groupec-traefik
+    services:
+      traefik:
+        image: traefik:v3.5
+        restart: unless-stopped
+        logging:
+          driver: "json-file"
+          options:
+            max-size: "10m"
+            max-file: "3"
+        security_opt:
+          - no-new-privileges:true
+        read_only: true
+        tmpfs:
+          - /tmp
+        command:
+          - "--entrypoints.web.address=:80"
+          # Redirection vers le port HTTPS externe de ce laboratoire: 4443.
+          - "--entrypoints.web.http.redirections.entrypoint.to=:4443"
+          - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+          - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+          - "--entrypoints.websecure.address=:443"
+          # Port interne reserve aux appels OIDC depuis Moodle, jamais publie sur l hote.
+          - "--entrypoints.sso-internal.address=:4443"
+          - "--entrypoints.ping.address=:8080"
+          - "--ping=true"
+          - "--ping.entrypoint=ping"
+          - "--providers.file.directory=/dynamic"
+          - "--providers.file.watch=true"
+          - "--api=true"
+          - "--api.dashboard=true"
+          - "--api.insecure=false"
+          - "--log.level=INFO"
+          - "--accesslog=true"
+        ports:
+          # Seul HTTPS 4443 peut etre accessible sur le reseau de la VM, sous controle UFW.
+          # Ne pas ouvrir 4443 a tous; autoriser une IP cliente lors des tests.
+          - "127.0.0.1:8080:8080"
+          - "127.0.0.1:8081:80"
+          - "4443:443"
+        volumes:
+          - /opt/GroupeC/traefik/dynamic:/dynamic:ro
+          - /opt/GroupeC/traefik/certs:/certs:ro
+          - /opt/GroupeC/traefik/auth:/auth:ro
+        networks:
+          exposition: {}
+          applicatif:
+            # IP interne stable: seule IP privee autorisee dans cURL Moodle.
+            ipv4_address: 172.28.240.10
+            aliases:
+              # Resolution interne du nom public vers Traefik pour les appels OIDC.
+              - keycloak.groupec.test
+              - moodle.groupec.test
+    networks:
+      exposition:
+        external: true
+        name: GroupeC-exposition
+      applicatif:
+        external: true
+        name: GroupeC-applicatif
+  # ------------------------------------------------------------------------
+  # TRAEFIK - certificat TLS dynamique
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/traefik/dynamic/tls.yaml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # Certificat local autosigne genere automatiquement par deploy.sh.
+    # Il n est PAS signe par une CA publique: navigateur = avertissement normal.
+    tls:
+      certificates:
+        - certFile: /certs/local.crt
+          keyFile: /certs/local.key
+      options:
+        default:
+          minVersion: VersionTLS12
+
+  # ------------------------------------------------------------------------
+  # TRAEFIK - routes de laboratoire + emplacements futurs services
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/traefik/dynamic/routes.yaml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # TRAEFIK - routage HTTPS local. Aucun socket Docker n est monte.
+    # Portainer et Grafana actifs; routage HTTPS depuis Traefik.
+    # Drupal et n8n restent a integrer ; Moodle et Keycloak sont ajoutes dans des routes separees.
+    http:
+      routers:
+        demo:
+          rule: "Host(`demo.localhost`)"
+          entryPoints:
+            - websecure
+          service: demo-service
+          tls: {}
+        dashboard:
+          rule: "Host(`dashboard.localhost`)"
+          entryPoints:
+            - websecure
+          service: api@internal
+          middlewares:
+            - dashboard-auth
+          tls: {}
+        portainer:
+          rule: "Host(`portainer.localhost`) || Host(`portainer.groupec.test`)"
+          entryPoints:
+            - websecure
+          service: portainer-service
+          tls: {}
+        # La route Grafana utilise le service DNS "grafana" sur GroupeC-applicatif.
+        grafana:
+          rule: "Host(`grafana.groupec.test`)"
+          entryPoints:
+            - websecure
+          service: grafana-service
+          tls: {}
+        # Moodle/Keycloak : routes ACTIVES dans dynamic/moodle-route.yaml et dynamic/keycloak-route.yaml.
+        # TODO DRUPAL: ajouter router Host(`drupal.localhost`) et service drupal:80.
+        # TODO N8N: ne PAS exposer son interface admin sans controle d acces.
+        # TODO OPENCAST: si actif, route HTTPS vers le service video interne.
+        # REDIS/LOKI: aucun routage public.
+        # OPENAPPSEC: mode standalone local, integrer selon la doc WAF/Traefik.
+      middlewares:
+        dashboard-auth:
+          basicAuth:
+            usersFile: /auth/users.htpasswd
+      services:
+        demo-service:
+          loadBalancer:
+            servers:
+              - url: "http://webtest:80"
+        portainer-service:
+          loadBalancer:
+            servers:
+              - url: "http://portainer:9000"
+        grafana-service:
+          loadBalancer:
+            servers:
+              - url: "http://grafana:3000"
+
+  # ------------------------------------------------------------------------
+  # NGINX provisoire - test du reverse proxy HTTPS (non publie)
+  # ------------------------------------------------------------------------
+  # ------------------------------------------------------------------------
+  # ROUTES SEPAREES ET MODELE DE REALM - AJOUTS MOODLE / KEYCLOAK
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/traefik/dynamic/moodle-route.yaml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # Moodle 5.3 via Traefik : route et middleware du collegue.
+    # Domaine canonique moodle.groupec.test ; alias .localhost pour les essais VM.
+    http:
+      routers:
+        moodle:
+          rule: (Host(`moodle.groupec.test`) || Host(`moodle.localhost`))
+          entryPoints:
+          - websecure
+          service: moodle-service
+          middlewares:
+          - moodle-headers
+          - moodle-ratelimit
+          tls: {}
+        moodle-login:
+          rule: (Host(`moodle.groupec.test`) || Host(`moodle.localhost`)) && PathPrefix(`/login`)
+          priority: 100
+          entryPoints:
+          - websecure
+          service: moodle-service
+          middlewares:
+          - moodle-headers
+          - moodle-login-ratelimit
+          tls: {}
+      middlewares:
+        moodle-headers:
+          headers:
+            stsSeconds: 31536000
+            contentTypeNosniff: true
+            customFrameOptionsValue: SAMEORIGIN
+            referrerPolicy: strict-origin-when-cross-origin
+        moodle-ratelimit:
+          rateLimit:
+            average: 50
+            burst: 100
+        moodle-login-ratelimit:
+          rateLimit:
+            average: 5
+            burst: 10
+      services:
+        moodle-service:
+          loadBalancer:
+            servers:
+            - url: http://moodle:8080
+
+- path: /opt/GroupeC/traefik/dynamic/keycloak-route.yaml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # Keycloak OIDC : 443 (public via 4443 hote), et 4443 interne pour Moodle.
+    # Aucun port HTTP direct vers l hote.
+    http:
+      routers:
+        keycloak:
+          rule: Host(`keycloak.groupec.test`) || Host(`keycloak.localhost`)
+          entryPoints:
+          - websecure
+          - sso-internal
+          service: keycloak-service
+          tls: {}
+      services:
+        keycloak-service:
+          loadBalancer:
+            servers:
+            - url: http://keycloak:8080
+
+- path: /opt/GroupeC/keycloak/groupec-realm.template.json
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    {
+      "realm": "groupec",
+      "enabled": true,
+      "displayName": "Groupe C - Plateforme pédagogique",
+      "registrationAllowed": false,
+      "loginWithEmailAllowed": true,
+      "resetPasswordAllowed": true,
+      "clients": [
+        {
+          "clientId": "moodle",
+          "name": "Moodle LMS",
+          "description": "SSO Moodle - Groupe C",
+          "enabled": true,
+          "protocol": "openid-connect",
+          "publicClient": false,
+          "clientAuthenticatorType": "client-secret",
+          "standardFlowEnabled": true,
+          "implicitFlowEnabled": false,
+          "directAccessGrantsEnabled": false,
+          "serviceAccountsEnabled": false,
+          "rootUrl": "https://moodle.groupec.test:4443",
+          "baseUrl": "https://moodle.groupec.test:4443",
+          "redirectUris": [
+            "https://moodle.groupec.test:4443/admin/oauth2callback.php"
+          ],
+          "webOrigins": [
+            "https://moodle.groupec.test:4443"
+          ],
+          "defaultClientScopes": [
+            "web-origins",
+            "acr",
+            "profile",
+            "roles",
+            "email"
+          ],
+          "optionalClientScopes": [
+            "address",
+            "phone",
+            "offline_access"
+          ]
+        }
+      ]
+    }
+
+- path: /opt/GroupeC/webtest/docker-compose.yml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # Service TEMPORAIRE pour prouver le routage de Traefik.
+    # Supprimable lorsque les vraies applications sont disponibles.
+    # EXPLICATION : Projet de demonstration Nginx, distinct du projet Traefik.
+    name: groupec-webtest
+    # EXPLICATION : Contient le service HTTP temporaire utilise pour valider le reverse proxy.
+    services:
+      # EXPLICATION : Nom DNS Docker webtest, utilise dans l URL definie par Traefik.
+      webtest:
+        # EXPLICATION : Image Nginx legere basee sur Alpine Linux (version 1.28).
+        image: nginx:1.28-alpine
+        # EXPLICATION : Redemarre automatiquement Nginx avec Docker tant qu il n est pas arrete volontairement.
+        restart: unless-stopped
+        logging:
+          driver: "json-file"
+          options:
+            max-size: "10m"
+            max-file: "3"
+        # EXPLICATION : Applique des protections supplementaires au processus du conteneur.
+        security_opt:
+          # EXPLICATION : Empeche le gain de nouveaux privileges pour les processus Nginx.
+          - no-new-privileges:true
+        # Aucun "ports": uniquement accessible via le reseau applicatif.
+        # EXPLICATION : Le service Nginx n est attache qu au reseau applicatif, pas aux donnees.
+        networks:
+          # EXPLICATION : Traefik et Nginx partagent ce reseau pour pouvoir communiquer.
+          - applicatif
+
+    # EXPLICATION : Le service Nginx n est attache qu au reseau applicatif, pas aux donnees.
+    networks:
+      applicatif:
+        # EXPLICATION : Compose reutilise un reseau cree ailleurs au lieu de creer son propre reseau prive.
+        external: true
+        # EXPLICATION : Nom exact du reseau cree par le script de deploiement.
+        name: GroupeC-applicatif
+  # ------------------------------------------------------------------------
+  # POSTGRESQL 17 - volume, secrets, reseau donnees uniquement
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/postgresql/docker-compose.yml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # EXPLICATION : Projet Compose separe, dedie a la couche de donnees PostgreSQL.
+    name: groupec-postgresql
+    # EXPLICATION : Liste des conteneurs de ce fichier : ici un seul serveur PostgreSQL.
+    services:
+      # EXPLICATION : Nom du service : les applications sur le reseau donnees utiliseront "postgres" comme hote.
+      postgres:
+        # EXPLICATION : Image PostgreSQL version 17 ; les mises a jour mineures peuvent changer avec ce tag.
+        image: postgres:17
+        # EXPLICATION : Relance PostgreSQL au redemarrage, sauf si on l a arrete volontairement.
+        restart: unless-stopped
+        logging:
+          driver: "json-file"
+          options:
+            max-size: "10m"
+            max-file: "3"
+        # EXPLICATION : Variables lues par le script de demarrage de l image officielle PostgreSQL.
+        environment:
+          # EXPLICATION : Cree le superutilisateur PostgreSQL initial nomme postgres.
+          POSTGRES_USER: postgres
+          # EXPLICATION : Cree/selectionne la base initiale postgres.
+          POSTGRES_DB: postgres
+          # EXPLICATION : Lit le mot de passe administrateur depuis un fichier secret, pas depuis une valeur dans le YAML.
+          POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
+          # EXPLICATION : Demande SCRAM-SHA-256 pour les connexions TCP initiales de PostgreSQL.
+          POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+        # Aucun port publie : connexion seulement via le reseau Docker donnees.
+        # EXPLICATION : Persiste les donnees et monte le script d initialisation dans le conteneur.
+        volumes:
+          # EXPLICATION : Volume Docker nomme : les donnees restent apres recreation du conteneur (sans "down -v").
+          - postgres_data:/var/lib/postgresql/data
+          # EXPLICATION : Script execute automatiquement par l image officielle si le volume de donnees est vide.
+          - /opt/GroupeC/postgresql/initdb/01-init-databases.sh:/docker-entrypoint-initdb.d/01-init-databases.sh:ro
+        # EXPLICATION : Liste des secrets accessibles a CE conteneur PostgreSQL.
+        secrets:
+          # EXPLICATION : Mot de passe administrateur, lu au demarrage par POSTGRES_PASSWORD_FILE.
+          - postgres_admin_password
+          # EXPLICATION : Mot de passe du role Moodle, utilise par le script initdb.
+          - moodle_db_password
+          # EXPLICATION : Mot de passe du role Keycloak, utilise par le script initdb.
+          - keycloak_db_password
+          # EXPLICATION : Mot de passe du role Drupal, utilise par le script initdb.
+          - drupal_db_password
+          # EXPLICATION : Mot de passe du role n8n, utilise par le script initdb.
+          - n8n_db_password
+          # EXPLICATION : Mot de passe de la base Opencast (service optionnel).
+          - opencast_db_password
+        # EXPLICATION : PostgreSQL rejoint UNIQUEMENT le reseau de donnees.
+        networks:
+          # EXPLICATION : Pas de liaison reseau directe avec Traefik ; seules les applications autorisees rejoindront donnees.
+          - donnees
+        # EXPLICATION : Verification recurrente pour savoir si PostgreSQL accepte des connexions.
+        healthcheck:
+          # EXPLICATION : pg_isready teste si PostgreSQL est pret ; ne verifie pas toutes les applications ni leurs schemas.
+          test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+          # EXPLICATION : Lance le healthcheck toutes les 5 secondes.
+          interval: 5s
+          # EXPLICATION : Un essai expire apres 3 secondes.
+          timeout: 3s
+          # EXPLICATION : Apres 30 echecs consecutifs, Docker peut declarer le conteneur unhealthy.
+          retries: 30
+          # EXPLICATION : Accorde un delai initial de 20 secondes avant de compter les echecs.
+          start_period: 20s
+
+    # EXPLICATION : Persiste les donnees et monte le script d initialisation dans le conteneur.
+    volumes:
+      # EXPLICATION : Declare le volume nomme que Docker gere pour conserver les fichiers de la base.
+      postgres_data:
+
+    # EXPLICATION : Liste des secrets accessibles a CE conteneur PostgreSQL.
+    secrets:
+      # Les valeurs sont generees a la creation de la VM, jamais dans ce YAML.
+      # EXPLICATION : Reference le fichier de secret administrateur genere sur la VM.
+      postgres_admin_password:
+        file: /opt/GroupeC/secrets/postgres_admin_password
+      # EXPLICATION : Reference le fichier du secret Moodle.
+      moodle_db_password:
+        file: /opt/GroupeC/secrets/moodle_db_password
+      # EXPLICATION : Reference le fichier du secret Keycloak.
+      keycloak_db_password:
+        file: /opt/GroupeC/secrets/keycloak_db_password
+      # EXPLICATION : Reference le fichier du secret Drupal.
+      drupal_db_password:
+        file: /opt/GroupeC/secrets/drupal_db_password
+      # EXPLICATION : Reference le fichier du secret n8n.
+      n8n_db_password:
+        file: /opt/GroupeC/secrets/n8n_db_password
+      # Mot de passe SQL Opencast, genere meme si le service est desactive.
+      opencast_db_password:
+        file: /opt/GroupeC/secrets/opencast_db_password
+
+    # EXPLICATION : PostgreSQL rejoint UNIQUEMENT le reseau de donnees.
+    networks:
+      donnees:
+        # EXPLICATION : Compose ne cree pas ce reseau : il reutilise GroupeC-donnees deja cree par deploy.sh.
+        external: true
+        # EXPLICATION : Nom commun de la zone de donnees, avec option Docker --internal.
+        name: GroupeC-donnees
+  # ------------------------------------------------------------------------
+  # POSTGRESQL - initialisation de 5 bases, 5 roles et isolation des connexions
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/postgresql/initdb/01-init-databases.sh
+  owner: root:root
+  permissions: !!str "0755"
+  content: |
+    #!/usr/bin/env bash
+    # EXPLICATION : Arrete le script d initialisation si une commande, variable ou pipeline echoue.
+    set -euo pipefail
+
+    # Lance par le point d'entree de postgres:17 UNIQUEMENT sur volume vide.
+    # Secrets generes sur la VM et montes dans /run/secrets; pas dans GitHub.
+    # Noms de bases/roles fixes et mots de passe aleatoires hexadecimaux.
+    # EXPLICATION : Repete la preparation pour 5 applications (Opencast optionnel inclus).
+    for app in moodle keycloak drupal n8n opencast; do
+      # EXPLICATION : Lit le secret de l application dans le conteneur. La variable Bash ne sera pas imprimee.
+      password="$(cat "/run/secrets/${app}_db_password")"
+      # EXPLICATION : Controle que le secret est une chaine hexadecimale de 64 caracteres (32 octets aleatoires).
+      [[ "$password" =~ ^[0-9a-f]{64}$ ]] || { echo "Mot de passe invalide pour $app" >&2; exit 1; }
+
+      # \gexec execute les instructions SQL produites par SELECT sans
+      # ajouter de bloc DO ni de transaction autour de CREATE DATABASE.
+      # EXPLICATION : Ouvre psql; -X ignore les reglages utilisateur, -q est discret, ON_ERROR_STOP arrete sur SQL invalide. <<SQL commence le SQL.
+      psql -X -q -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres <<SQL
+    SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', '${app}', '${password}')
+    WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='${app}')
+    \gexec
+    SELECT format('CREATE DATABASE %I OWNER %I', '${app}', '${app}')
+    WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname='${app}')
+    \gexec
+    SQL
+      # Isolation: aucun role applicatif ne peut se connecter aux AUTRES BDs.
+      # Par defaut, PostgreSQL accorde CONNECT au role PUBLIC ; on le retire.
+      psql -X -q -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres \
+        -c "REVOKE CONNECT ON DATABASE \"${app}\" FROM PUBLIC; GRANT CONNECT ON DATABASE \"${app}\" TO \"${app}\";"
+      # Le schema public ne doit pas etre accessible librement aux autres roles.
+      psql -X -q -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$app" \
+        -c "REVOKE ALL ON SCHEMA public FROM PUBLIC; GRANT USAGE, CREATE ON SCHEMA public TO \"${app}\";"
+
+      # EXPLICATION : Efface la variable temporaire de mot de passe apres creation du role.
+      unset password
+      # EXPLICATION : Affiche seulement le nom de l application dans les journaux, jamais son mot de passe.
+      echo "Base et role prets: ${app}"
+    done
+
+  # ------------------------------------------------------------------------
+  # MOODLE - INTEGRE : compose du collegue, HTTPS, PostgreSQL
+  # ------------------------------------------------------------------------
+  # ------------------------------------------------------------------------
+  # MOODLE - provisionnement SSO natif, configure automatiquement au premier boot
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/moodle/configure-sso.php
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    <?php
+    // CR465 - SSO Moodle -> Keycloak, lors du premier boot cloud-init.
+    // Script idempotent : ne duplique ni fournisseur ni endpoints.
+    define('CLI_SCRIPT', true);
+    require '/var/www/html/config.php';
+    \core\session\manager::set_user(get_admin());
+
+    $secret = trim(stream_get_contents(STDIN));
+    if (!preg_match('/^[a-f0-9]{48,128}$/', $secret)) {
+        fwrite(STDERR, "ERREUR : secret client OIDC invalide.\n");
+        exit(1);
+    }
+    $issuername = 'Keycloak Groupe C';
+    $baseurl = 'https://keycloak.groupec.test:4443/realms/groupec';
+
+    // Conserver les authentifications deja actives (dont email).
+    $auth = array_filter(array_map('trim', explode(',', (string)($CFG->auth ?? ''))));
+    if (!in_array('oauth2', $auth, true)) {
+        $auth[] = 'oauth2';
+        set_config('auth', implode(',', $auth));
+    }
+
+    $existing = $DB->get_record('oauth2_issuer', ['name' => $issuername]);
+    if ($existing) {
+        $issuer = new \core\oauth2\issuer((int)$existing->id);
+        $issuer->set('clientid', 'moodle');
+        $issuer->set('clientsecret', $secret);
+        $issuer->set('baseurl', $baseurl);
+        $issuer->set('enabled', true);
+        $issuer->set('showonloginpage', \core\oauth2\issuer::LOGINONLY);
+        $issuer->set('loginscopes', 'openid profile email');
+        $issuer->update();
+        echo "Fournisseur Keycloak deja present, parametres verifies.\n";
+    } else {
+        // La creation peut enregistrer l'issuer puis echouer pendant la
+        // decouverte reseau. Reprendre cet issuer et creer les endpoints connus.
+        try {
+            $issuer = \core\oauth2\api::create_issuer((object)[
+            'name' => $issuername,
+            // Champ image NOT NULL dans Moodle: valeur vide autorisee.
+            'image' => '',
+            'clientid' => 'moodle',
+            'clientsecret' => $secret,
+            'baseurl' => $baseurl,
+            'servicetype' => 'custom',
+            'enabled' => true,
+            'showonloginpage' => \core\oauth2\issuer::LOGINONLY,
+            'loginscopes' => 'openid profile email',
+            'requireconfirmation' => false,
+            ]);
+        } catch (\Throwable $err) {
+            $partial = $DB->get_record('oauth2_issuer', ['name' => $issuername]);
+            if (!$partial) {
+                throw $err;
+            }
+            $issuer = new \core\oauth2\issuer((int)$partial->id);
+            $issuer->set('clientid', 'moodle');
+            $issuer->set('clientsecret', $secret);
+            $issuer->set('baseurl', $baseurl);
+            $issuer->set('enabled', true);
+            $issuer->set('showonloginpage', \core\oauth2\issuer::LOGINONLY);
+            $issuer->set('loginscopes', 'openid profile email');
+            $issuer->update();
+            echo "Issuer partiellement cree lors de la decouverte; endpoints configures explicitement.\n";
+        }
+        echo "Fournisseur Keycloak cree ou repare.\n";
+    }
+
+    $id = (int)$issuer->get('id');
+    $endpointurls = [
+        'authorization_endpoint' => $baseurl . '/protocol/openid-connect/auth',
+        'token_endpoint' => $baseurl . '/protocol/openid-connect/token',
+        'userinfo_endpoint' => $baseurl . '/protocol/openid-connect/userinfo',
+    ];
+    foreach ($endpointurls as $name => $url) {
+        $row = $DB->get_record('oauth2_endpoint', ['issuerid' => $id, 'name' => $name]);
+        if ($row) {
+            if ($row->url !== $url) {
+                $endpoint = new \core\oauth2\endpoint((int)$row->id);
+                $endpoint->set('url', $url);
+                $endpoint->update();
+            }
+        } else {
+            \core\oauth2\api::create_endpoint((object)[
+                'issuerid' => $id, 'name' => $name, 'url' => $url,
+            ]);
+        }
+    }
+
+    // Keycloak userinfo : given_name/family_name/email -> champs Moodle obligatoires.
+    foreach (['given_name' => 'firstname', 'family_name' => 'lastname', 'email' => 'email'] as $external => $internal) {
+        if (!$DB->record_exists('oauth2_user_field_mapping', ['issuerid' => $id, 'internalfield' => $internal])) {
+            \core\oauth2\api::create_user_field_mapping((object)[
+                'issuerid' => $id, 'externalfield' => $external, 'internalfield' => $internal,
+            ]);
+        }
+    }
+
+    if (!$issuer->is_available_for_login()) {
+        fwrite(STDERR, "ERREUR : fournisseur non utilisable sur la page de connexion.\n");
+        exit(1);
+    }
+    foreach (array_keys($endpointurls) as $name) {
+        if (!$DB->record_exists('oauth2_endpoint', ['issuerid' => $id, 'name' => $name])) {
+            fwrite(STDERR, "ERREUR : endpoint OIDC manquant: $name\n");
+            exit(1);
+        }
+    }
+    $mappings = $DB->count_records('oauth2_user_field_mapping', ['issuerid' => $id]);
+    if ($mappings < 3) {
+        fwrite(STDERR, "ERREUR : mappings SSO incomplets ($mappings/3).\n");
+        exit(1);
+    }
+    echo "SUCCES : fournisseur Keycloak OAuth2 configure dans Moodle (issuer id=$id, endpoints et mappings presents).\n";
+
+- path: /opt/GroupeC/moodle/configure-moodle.php
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+      <?php
+      define('CLI_SCRIPT', true);
+      require('/var/www/html/public/config.php');
+
+      \core\session\manager::set_user(get_admin());
+
+      // Activation des services web et du protocole REST.
+      set_config('enablewebservices', 1);
+      set_config('webserviceprotocols', 'rest');
+
+      echo "Configuration REST Moodle terminee.\n";
+      // Creation automatique du cours.
+      require_once($CFG->dirroot . '/course/lib.php');
+
+      $course = $DB->get_record('course', ['shortname' => 'CYBER465']);
+
+      if (!$course) {
+          $data = new stdClass();
+          $data->fullname = 'Introduction à la cybersécurité';
+          $data->shortname = 'CYBER465';
+          $data->category = 1;
+          $data->format = 'topics';
+          $data->numsections = 3;
+          $data->visible = 1;
+          $data->summary = 'Introduction aux principes fondamentaux de la cybersécurité.';
+          $data->summaryformat = FORMAT_HTML;
+
+          $course = create_course($data);
+      }
+
+      echo "Cours Moodle disponible : ID={$course->id}\n";
+      // Desactivation du message de bienvenue.
+      $DB->set_field('enrol', 'customint1', 0, [
+          'courseid' => $course->id,
+          'enrol' => 'manual'
+      ]);
+
+      echo "Message de bienvenue desactive.\n";
+      // Creation du compte de service n8n.
+      require_once($CFG->dirroot . '/user/lib.php');
+
+      $serviceuser = $DB->get_record('user', [
+          'username' => 'n8n-service',
+          'deleted' => 0
+      ]);
+
+      if (!$serviceuser) {
+          $user = new stdClass();
+          $user->username = 'n8n-service';
+          $user->firstname = 'n8n';
+          $user->lastname = 'Service';
+          $user->email = 'n8n-service@groupec.test';
+          $user->auth = 'manual';
+          $user->confirmed = 1;
+          $user->mnethostid = $CFG->mnet_localhost_id;
+          $user->password = bin2hex(random_bytes(24)) . 'Aa1!';
+
+          $userid = user_create_user($user);
+          $serviceuser = $DB->get_record('user', ['id' => $userid]);
+      }
+
+      echo "Compte de service n8n disponible.\n";
+
+            // Creation du role API n8n.
+      $role = $DB->get_record('role', [
+          'shortname' => 'n8n_api'
+      ]);
+
+      if (!$role) {
+          $roleid = create_role(
+              'n8n API Integration',
+              'n8n_api',
+              'Role dedie a integration Moodle avec n8n',
+              ''
+          );
+      } else {
+          $roleid = $role->id;
+      }
+
+      set_role_contextlevels($roleid, [
+          CONTEXT_SYSTEM,
+          CONTEXT_COURSE
+      ]);
+
+      $systemcontext = context_system::instance();
+
+      role_assign($roleid, $serviceuser->id, $systemcontext->id);
+
+      echo "Role API n8n disponible.\n";
+      // Permissions au niveau systeme.
+      $capabilities = [
+          'webservice/rest:use',
+          'moodle/user:viewdetails',
+          'moodle/course:useremail',
+          'moodle/course:view'
+      ];
+
+      foreach ($capabilities as $capability) {
+          assign_capability(
+              $capability,
+              CAP_ALLOW,
+              $roleid,
+              $systemcontext->id,
+              true
+          );
+      }
+
+      // Permissions limitees au cours CYBER465.
+      $coursecontext = context_course::instance($course->id);
+
+      assign_capability('enrol/manual:enrol', CAP_ALLOW,
+          $roleid, $coursecontext->id, true);
+
+      assign_capability('moodle/role:assign', CAP_ALLOW,
+          $roleid, $coursecontext->id, true);
+
+      echo "Permissions API n8n configurees.\n";
+
+      // Autoriser uniquement l attribution du role Student.
+      $studentrole = $DB->get_record('role', [
+          'shortname' => 'student'
+      ], '*', MUST_EXIST);
+
+      $DB->delete_records('role_allow_assign', [
+          'roleid' => $roleid
+      ]);
+
+      $DB->insert_record('role_allow_assign', [
+          'roleid' => $roleid,
+          'allowassign' => $studentrole->id
+      ]);
+
+      echo "Attribution limitee au role Student.\n";
+
+      // Creation du service web Moodle pour n8n.
+      $service = $DB->get_record('external_services', [
+          'shortname' => 'n8n_moodle'
+      ]);
+
+      if (!$service) {
+          $service = new stdClass();
+          $service->name = 'n8n Moodle Integration';
+          $service->shortname = 'n8n_moodle';
+          $service->enabled = 1;
+          $service->restrictedusers = 1;
+          $service->downloadfiles = 0;
+          $service->uploadfiles = 0;
+          $service->timecreated = time();
+
+          $service->id = $DB->insert_record(
+              'external_services', $service
+          );
+      }
+
+      // Fonctions API autorisees.
+      $functions = [
+          'core_user_get_users_by_field',
+          'core_course_get_courses',
+          'enrol_manual_enrol_users'
+      ];
+
+      foreach ($functions as $function) {
+          $record = [
+              'externalserviceid' => $service->id,
+              'functionname' => $function
+          ];
+
+          if (!$DB->record_exists('external_services_functions', $record)) {
+              $DB->insert_record('external_services_functions', $record);
+          }
+      }
+
+      echo "Service web API n8n configure.\n";
+
+      // Autorisation du compte de service n8n.
+      $authorization = [
+          'externalserviceid' => $service->id,
+          'userid' => $serviceuser->id
+      ];
+
+      if (!$DB->record_exists('external_services_users', $authorization)) {
+          $authorization['timecreated'] = time();
+
+          $DB->insert_record(
+              'external_services_users',
+              $authorization
+          );
+      }
+
+      echo "Compte n8n autorise a utiliser API Moodle.\n";
+
+      // Generation du jeton API n8n.
+      $token = $DB->get_record('external_tokens', [
+          'userid' => $serviceuser->id,
+          'externalserviceid' => $service->id,
+          'tokentype' => 0
+      ]);
+
+      if (!$token) {
+          $token = new stdClass();
+          $token->token = bin2hex(random_bytes(16));
+          $token->tokentype = 0;
+          $token->userid = $serviceuser->id;
+          $token->externalserviceid = $service->id;
+          $token->contextid = $systemcontext->id;
+          $token->creatorid = get_admin()->id;
+          $token->timecreated = time();
+
+          $token->id = $DB->insert_record(
+              'external_tokens', $token
+          );
+      }
+
+      echo "Jeton API n8n disponible.\n";
+
+      // Recuperation du jeton sur demande uniquement.
+      if (in_array('--get-token', $argv ?? [], true)) {
+          echo "N8N_MOODLE_TOKEN=" . $token->token . PHP_EOL;
+      }
+
+      echo "Configuration API Moodle terminee.\n";
+
+      // Creation des sections du cours.
+      course_create_sections_if_missing($course, [1, 2, 3]);
+
+      $sections = [
+          1 => 'Introduction a la cybersecurite',
+          2 => 'Menaces et bonnes pratiques',
+          3 => 'Evaluation des connaissances'
+      ];
+
+      foreach ($sections as $number => $name) {
+          $section = $DB->get_record('course_sections', [
+              'course' => $course->id,
+              'section' => $number
+          ], '*', MUST_EXIST);
+
+          course_update_section($course, $section, [
+              'name' => $name
+          ]);
+      }
+
+      echo "Sections du cours configurees.\n";
+
+      // Creation des pages de formation.
+      require_once($CFG->dirroot . '/course/modlib.php');
+
+      $pages = [
+          [
+              'section' => 1,
+              'name' => 'Les fondamentaux de la cybersecurite',
+              'content' => '<p>La cybersecurite repose sur trois principes : confidentialite, integrite et disponibilite.</p>'
+          ],
+          [
+              'section' => 2,
+              'name' => 'Menaces et bonnes pratiques',
+              'content' => '<p>Les principales menaces sont le phishing, les logiciels malveillants et les rancongiciels. Utilisez des mots de passe robustes, le MFA et les mises a jour regulieres.</p>'
+          ]
+      ];
+
+      foreach ($pages as $page) {
+          if (!$DB->record_exists('page', [
+              'course' => $course->id,
+              'name' => $page['name']
+          ])) {
+              $module = new stdClass();
+              $module->modulename = 'page';
+              $module->module = $DB->get_field('modules', 'id', [
+                  'name' => 'page'
+              ]);
+              $module->course = $course->id;
+              $module->section = $page['section'];
+              $module->name = $page['name'];
+              $module->intro = '';
+              $module->introformat = FORMAT_HTML;
+              $module->content = $page['content'];
+              $module->contentformat = FORMAT_HTML;
+              $module->visible = 1;
+              $module->display = 5;
+
+              add_moduleinfo($module, $course);
+          }
+      }
+
+      echo "Pages de formation configurees.\n";
+
+      // Creation du quiz.
+      $quizname = 'Evaluation des connaissances';
+
+      $quiz = $DB->get_record('quiz', [
+          'course' => $course->id,
+          'name' => $quizname
+      ]);
+
+      if (!$quiz) {
+          $module = new stdClass();
+          $module->modulename = 'quiz';
+          $module->module = $DB->get_field('modules', 'id', [
+              'name' => 'quiz'
+          ]);
+          $module->course = $course->id;
+          $module->section = 3;
+          $module->name = $quizname;
+          $module->intro = 'Testez vos connaissances en cybersecurite.';
+          $module->introformat = FORMAT_HTML;
+          $module->visible = 1;
+          $module->timelimit = 600;
+          $module->quizpassword = '';
+          $module->attempts = 2;
+          $module->grade = 10;
+          $module->gradepass = 6;
+          $module->grademethod = 1;
+          $module->preferredbehaviour = 'deferredfeedback';
+
+          add_moduleinfo($module, $course);
+      }
+
+      echo "Quiz Moodle configure.\n";
+
+      // Questions et reponses du quiz.
+      $questions = [
+          [
+              'question' => 'Quels sont les trois piliers de la cybersecurite ?',
+              'answers' => [
+                  'Confidentialite, integrite et disponibilite',
+                  'Authentification, rapidite et stockage',
+                  'Internet, reseau et serveur'
+              ]
+          ],
+          [
+              'question' => 'Quel est le but du phishing ?',
+              'answers' => [
+                  'Voler des informations sensibles',
+                  'Ameliorer la securite',
+                  'Mettre a jour un logiciel'
+              ]
+          ],
+          [
+              'question' => 'Que signifie MFA ?',
+              'answers' => [
+                  'Authentification multifacteur',
+                  'Module de filtrage automatique',
+                  'Methode de fichier avancee'
+              ]
+          ],
+          [
+              'question' => 'Quelle pratique ameliore la securite ?',
+              'answers' => [
+                  'Effectuer regulierement les mises a jour',
+                  'Partager ses mots de passe',
+                  'Desactiver les protections'
+              ]
+          ],
+          [
+              'question' => 'Quel est le but d un rancongiciel ?',
+              'answers' => [
+                  'Bloquer les donnees et exiger une rancon',
+                  'Accelerer un ordinateur',
+                  'Proteger les fichiers'
+              ]
+          ]
+      ];      
+      // Enregistrement des questions dans le quiz.
+      require_once($CFG->dirroot . '/lib/questionlib.php');
+      require_once($CFG->dirroot . '/mod/quiz/locallib.php');
+
+      $quiz = $DB->get_record('quiz', [
+          'course' => $course->id,
+          'name' => $quizname
+      ], '*', MUST_EXIST);
+
+      $cm = get_coursemodule_from_instance(
+          'quiz', $quiz->id, $course->id, false, MUST_EXIST
+      );
+
+      $quizcontext = context_module::instance($cm->id);
+      $category = question_get_default_category($quizcontext->id, true);
+
+      foreach ($questions as $index => $item) {
+          $name = 'CYBER465-Q' . ($index + 1);
+
+          $questionid = $DB->get_field_sql(
+              "SELECT q.id
+                 FROM {question} q
+                 JOIN {question_versions} qv ON qv.questionid = q.id
+                 JOIN {question_bank_entries} qbe
+                   ON qbe.id = qv.questionbankentryid
+                WHERE qbe.questioncategoryid = :category
+                  AND q.name = :name
+             ORDER BY qv.version DESC",
+              ['category' => $category->id, 'name' => $name],
+              IGNORE_MULTIPLE
+          );
+
+          if (!$questionid) {
+              $question = new stdClass();
+              $question->qtype = 'multichoice';
+
+              $form = new stdClass();
+              $form->category = (string)$category->id;
+              $form->name = $name;
+              $form->questiontext = [
+                  'text' => $item['question'],
+                  'format' => FORMAT_HTML
+              ];
+              $form->generalfeedback = [
+                  'text' => '',
+                  'format' => FORMAT_HTML
+              ];
+              $form->defaultmark = 2;
+              $form->penalty = 0;
+              $form->single = 1;
+              $form->shuffleanswers = 1;
+              $form->answernumbering = 'abc';
+              $form->status = 'ready';
+
+              foreach ($item['answers'] as $i => $answer) {
+                  $form->answer[$i] = [
+                      'text' => $answer,
+                      'format' => FORMAT_HTML
+                  ];
+                  $form->fraction[$i] = ($i === 0) ? 1 : 0;
+                  $form->feedback[$i] = [
+                      'text' => '',
+                      'format' => FORMAT_HTML
+                  ];
+              }
+
+              foreach (['correctfeedback',
+                        'partiallycorrectfeedback',
+                        'incorrectfeedback'] as $field) {
+                  $form->$field = [
+                      'text' => '',
+                      'format' => FORMAT_HTML
+                  ];
+              }
+
+              $saved = question_bank::get_qtype('multichoice')
+                  ->save_question($question, $form);
+
+              $questionid = $saved->id;
+          }
+
+          quiz_add_quiz_question($questionid, $quiz, 0, 2);
+      }
+
+      echo "Questions du quiz configurees.\n";
+      // Recalcul du total des points du quiz.
+      \mod_quiz\quiz_settings::create($quiz->id)
+          ->get_grade_calculator()
+          ->recompute_quiz_sumgrades();
+
+      echo "Total des points du quiz recalcule.\n";
+
+- path: /opt/GroupeC/moodle/docker-compose.yml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # Moodle - service LMS; acces HTTPS uniquement via Traefik.
+    # Les variables sensibles proviennent du .env local genere par deploy.sh.
+    # Image communautaire (pas d image Moodle officielle de production):
+    # base Alpine legere, execution en utilisateur non-root, version figee.
+    name: groupec-moodle
+    services:
+      moodle:
+        image: erseco/alpine-moodle:v5.3.0
+        restart: unless-stopped
+        env_file:
+          - /opt/GroupeC/moodle/.env
+        environment:
+          SITE_URL: "https://moodle.groupec.test:4443"
+          DB_TYPE: pgsql
+          DB_HOST: postgres
+          DB_PORT: "5432"
+          DB_NAME: moodle
+          DB_USER: moodle
+          REVERSEPROXY: "false"
+          # TLS termine par Traefik: Moodle recoit du HTTP mais son wwwroot
+          # est en https. sslproxy=true evite boucles de redirection et contenu mixte.
+          SSLPROXY: "true"
+        # --- Moindre privilege ---
+        security_opt:
+          - no-new-privileges:true
+        # nginx/php-fpm ecoutent sur 8080 en non-root: aucune capability Linux requise.
+        cap_drop:
+          - ALL
+        # --- Limites de ressources (anti-DoS, anti fork bomb) ---
+        mem_limit: 1g
+        cpus: "1.5"
+        pids_limit: 256
+        # --- Systeme de fichiers ---
+        # read_only impossible: l image ecrit config.php au demarrage (ecart justifie).
+        # /tmp en memoire, sans execution de binaires ni setuid.
+        tmpfs:
+          - /tmp:rw,noexec,nosuid,size=128m
+        volumes:
+          - moodledata:/var/www/moodledata
+          - /opt/GroupeC/moodle/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro
+          - /opt/GroupeC/moodle/configure-sso.php:/opt/groupec-configure-sso.php:ro
+          - /opt/GroupeC/moodle/configure-curl-oidc.php:/opt/groupec-configure-curl-oidc.php:ro
+        # --- Journaux bornes: evite de remplir le disque de la VM ---
+        logging:
+          driver: json-file
+          options:
+            max-size: "10m"
+            max-file: "3"
+        # --- Sante: la page de connexion doit repondre ---
+        healthcheck:
+          test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8080/login/index.php"]
+          interval: 30s
+          timeout: 5s
+          retries: 5
+          start_period: 180s
+        networks:
+          - applicatif
+          - donnees
+        # Aucun port publie : Traefik joint moodle:8080 sur applicatif.
+        expose:
+          - "8080"
+    volumes:
+      moodledata:
+    networks:
+      applicatif:
+        external: true
+        name: GroupeC-applicatif
+      donnees:
+        external: true
+        name: GroupeC-donnees
+  # ------------------------------------------------------------------------
+  # KEYCLOAK - INTEGRE : realm, secrets locaux, HTTPS, PostgreSQL
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/keycloak/docker-compose.yml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # Keycloak : image/version du collegue ; PostgreSQL et secrets communs GroupeC.
+    # Aucun port hote public. Variables privees lues depuis un fichier local genere.
+    name: groupec-keycloak
+    services:
+      keycloak:
+        image: quay.io/keycloak/keycloak:26.8.2
+        restart: unless-stopped
+        command:
+        - start
+        - --import-realm
+        environment:
+          KC_DB: postgres
+          KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+          KC_DB_USERNAME: keycloak
+          KC_BOOTSTRAP_ADMIN_USERNAME: admin
+          KC_HTTP_ENABLED: 'true'
+          KC_HOSTNAME: https://keycloak.groupec.test:4443
+          KC_PROXY_HEADERS: xforwarded
+        networks:
+        - applicatif
+        - donnees
+        volumes:
+        - /opt/GroupeC/keycloak/groupec-realm.json:/opt/keycloak/data/import/groupec-realm.json:ro
+        env_file:
+        - /opt/GroupeC/keycloak/.env
+        security_opt:
+        - no-new-privileges:true
+        cap_drop:
+        - ALL
+        mem_limit: 1100m
+        cpus: '1.5'
+        pids_limit: 512
+        logging:
+          driver: json-file
+          options:
+            max-size: 10m
+            max-file: '3'
+    networks:
+      applicatif:
+        external: true
+        name: GroupeC-applicatif
+      donnees:
+        external: true
+        name: GroupeC-donnees
+  # ------------------------------------------------------------------------
+  # EMPLACEMENT RESERVE - DRUPAL obligatoire, NON deploye
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/drupal/docker-compose.yml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # DRUPAL - EMPLACEMENT A COMPLETER PAR LE MEMBRE RESPONSABLE.
+    # Mission : Drupal Commerce et paiement fictif.
+    # CE FICHIER EST INTENTIONNELLEMENT UN GABARIT COMMENTE ; NE PAS LE LANCER.
+    # Coller ici un vrai Docker Compose et retirer ces commentaires au besoin.
+    # Nom de service recommande : drupal.
+    # Traefik doit joindre ce service par GroupeC-applicatif, sans port hote public.
+    # PostgreSQL: hote "postgres", port 5432, base "drupal", role "drupal".
+    # Secret: /opt/GroupeC/secrets/drupal_db_password (valeur generee par deploy.sh).
+    # Le service doit appartenir aux DEUX reseaux GroupeC-applicatif et GroupeC-donnees.
+    # Reseaux EXTERNES a reutiliser, selon le besoin:
+    # networks:
+    #   applicatif:
+    #     external: true
+    #     name: GroupeC-applicatif
+    #   donnees:
+    #     external: true
+    #     name: GroupeC-donnees
+    # Installer Commerce et configurer un paiement fictif / sandbox.
+
+  # ------------------------------------------------------------------------
+  # EMPLACEMENT RESERVE - N8N obligatoire, NON deploye
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/n8n/docker-compose.yml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # N8N - EMPLACEMENT A COMPLETER PAR LE MEMBRE RESPONSABLE.
+    # Mission : Automatisation Drupal -> Moodle.
+    # CE FICHIER EST INTENTIONNELLEMENT UN GABARIT COMMENTE ; NE PAS LE LANCER.
+    # Coller ici un vrai Docker Compose et retirer ces commentaires au besoin.
+    # Nom de service recommande : n8n.
+    # Traefik doit joindre ce service par GroupeC-applicatif, sans port hote public.
+    # PostgreSQL: hote "postgres", port 5432, base "n8n", role "n8n".
+    # Secret: /opt/GroupeC/secrets/n8n_db_password (valeur generee par deploy.sh).
+    # Le service doit appartenir aux DEUX reseaux GroupeC-applicatif et GroupeC-donnees.
+    # Reseaux EXTERNES a reutiliser, selon le besoin:
+    # networks:
+    #   applicatif:
+    #     external: true
+    #     name: GroupeC-applicatif
+    #   donnees:
+    #     external: true
+    #     name: GroupeC-donnees
+    # Configurer un workflow demonstration vente Drupal -> acces Moodle.
+
+  # ------------------------------------------------------------------------
+  # PORTAINER CE - INTEGRE ET DEPLOYE
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/portainer/docker-compose.yml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # =============================================================================
+    # CR465 - GroupeC
+    # Portainer CE - Console graphique d'exploitation Docker Rootless
+    # =============================================================================
+    #
+    # Objectifs :
+    # - Fournir une interface graphique pour observer les conteneurs, réseaux,
+    #   volumes, états et journaux.
+    # - Utiliser le moteur Docker Rootless de l'utilisateur ubuntu.
+    # - Ne publier AUCUN port Portainer directement sur l'hôte.
+    # - Rendre Portainer accessible uniquement via Traefik.
+    # - Rejoindre uniquement le réseau applicatif.
+    # - Conserver les données Portainer dans un volume persistant.
+    #
+    # Prérequis :
+    # - Docker Rootless opérationnel pour ubuntu.
+    # - Variable XDG_RUNTIME_DIR disponible, par exemple :
+    #       /run/user/1000
+    # - Réseau Docker externe GroupeC-applicatif déjà créé.
+    # - Secret présent :
+    #       /opt/GroupeC/secrets/portainer_admin_password
+    #
+    # Accès :
+    #       https://portainer.localhost:4443/
+    #
+    # Le routage HTTPS est réalisé par Traefik.
+    # =============================================================================
+
+
+    name: groupec-portainer
+
+
+    services:
+
+      portainer:
+
+        # -------------------------------------------------------------------------
+        # Image
+        # -------------------------------------------------------------------------
+
+        # Version explicite afin d'éviter l'utilisation du tag "latest"
+        # et de faciliter la reproductibilité et les scans de sécurité.
+        image: portainer/portainer-ce:2.45.3
+
+        restart: unless-stopped
+        logging:
+          driver: "json-file"
+          options:
+            max-size: "10m"
+            max-file: "3"
+
+
+        # -------------------------------------------------------------------------
+        # Connexion au moteur Docker Rootless
+        # -------------------------------------------------------------------------
+
+        # Portainer communique avec le socket Docker Rootless monté à l'intérieur
+        # du conteneur sous /var/run/docker.sock.
+        command:
+          - "-H"
+          - "unix:///var/run/docker.sock"
+
+          # Active le serveur HTTP interne de Portainer.
+          # Il n'est PAS directement publié sur l'hôte.
+          - "--http-enabled"
+
+          # Initialise le mot de passe administrateur depuis un fichier secret.
+          # Cette option est utilisée uniquement lors de la première initialisation
+          # de la base Portainer.
+          - "--admin-password-file"
+          - "/run/secrets/portainer_admin_password"
+
+
+        # -------------------------------------------------------------------------
+        # Sécurité à l'exécution
+        # -------------------------------------------------------------------------
+
+        security_opt:
+          - no-new-privileges:true
+
+        # Limitation des ressources de l'interface d'administration.
+        mem_limit: 512m
+
+        cpus: "1.0"
+
+        pids_limit: 256
+
+
+        # -------------------------------------------------------------------------
+        # Réseau / exposition
+        # -------------------------------------------------------------------------
+
+        # Le port 9000 est disponible UNIQUEMENT à l'intérieur des réseaux Docker.
+        #
+        # Il ne faut PAS utiliser :
+        #
+        # ports:
+        #   - "9000:9000"
+        #
+        # Traefik doit joindre directement :
+        #
+        # http://portainer:9000
+        #
+        expose:
+          - "9000"
+
+
+        # -------------------------------------------------------------------------
+        # Volumes
+        # -------------------------------------------------------------------------
+
+        volumes:
+
+          # Socket du moteur Docker Rootless de ubuntu.
+          #
+          # Exemple :
+          # XDG_RUNTIME_DIR=/run/user/1000
+          #
+          # Le socket réel devient :
+          # /run/user/1000/docker.sock
+          #
+          # Il est présenté à Portainer sous le chemin standard attendu :
+          # /var/run/docker.sock
+          #
+          # ATTENTION :
+          # le socket Docker donne à Portainer un contrôle important sur le moteur.
+          # Ce montage est donc réservé à Portainer car il est nécessaire à sa
+          # fonction d'administration.
+          - ${XDG_RUNTIME_DIR}/docker.sock:/var/run/docker.sock
+
+          # Stockage persistant de Portainer :
+          # utilisateurs, configuration, environnements, préférences, etc.
+          - portainer_data:/data
+
+
+        # -------------------------------------------------------------------------
+        # Secrets
+        # -------------------------------------------------------------------------
+
+        secrets:
+          - portainer_admin_password
+
+
+        # -------------------------------------------------------------------------
+        # Segmentation réseau
+        # -------------------------------------------------------------------------
+
+        # Portainer appartient UNIQUEMENT au réseau applicatif.
+        #
+        # Il ne rejoint pas :
+        # - GroupeC-exposition
+        # - GroupeC-donnees
+        #
+        # Il n'a aucune raison de communiquer avec PostgreSQL.
+        networks:
+          - applicatif
+
+
+    # =============================================================================
+    # VOLUMES
+    # =============================================================================
+
+    volumes:
+
+      portainer_data:
+
+        # Nom explicite afin de faciliter son identification dans Portainer
+        # et dans les commandes Docker.
+        name: GroupeC-portainer-data
+
+
+    # =============================================================================
+    # SECRETS
+    # =============================================================================
+
+    secrets:
+
+      portainer_admin_password:
+
+        # Le secret est généré localement sur la VM.
+        # Il ne doit jamais être stocké dans GitHub.
+        file: /opt/GroupeC/secrets/portainer_admin_password
+
+
+    # =============================================================================
+    # RÉSEAUX
+    # =============================================================================
+
+    networks:
+
+      applicatif:
+
+        # Ce réseau est créé par le provisioning général du projet.
+        # Ce fichier Compose ne doit donc pas créer son propre réseau isolé.
+        external: true
+
+        name: GroupeC-applicatif
+  # ------------------------------------------------------------------------
+  # SECTION OPTIONNELLE - OPENCAST (videos Moodle) : NON DEPLOYE
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/opencast/docker-compose.yml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # OPENCAST - OPTIONNEL mais fortement souhaite dans l enonce.
+    # EMPLACEMENT RESERVE : ce fichier est une aide d integration, pas un Compose actif.
+    # Mission: heberger du contenu video et permettre un lien/usage depuis Moodle.
+    # Base SQL preparee AUTOMATIQUEMENT par la presente base cloud-init:
+    #   hote: postgres ; port: 5432 ; base: opencast ; utilisateur: opencast.
+    #   secret: /opt/GroupeC/secrets/opencast_db_password.
+    # La configuration JDBC PostgreSQL d Opencast depend de la version retenue:
+    #   jdbc:postgresql://postgres:5432/opencast
+    # Verifier les besoins reels (image officielle, indexation, fichiers video,
+    # eventuels stockages/ports et mecanisme de liaison Moodle).
+    # Stockage persistant a planifier: bibliotheque media, donnees applicatives.
+    # Traefik: ajouter une route HTTPS apres installation, exemple:
+    #   Host(`opencast.localhost`) -> http://opencast:<port-app>.
+    # Reseaux: GroupeC-applicatif + GroupeC-donnees (pour PostgreSQL).
+    # AUCUN port du service expose directement sur l hote.
+    # Exemple de declarations reseaux Compose apres ecriture du vrai service:
+    # networks:
+    #   applicatif:
+    #     external: true
+    #     name: GroupeC-applicatif
+    #   donnees:
+    #     external: true
+    #     name: GroupeC-donnees
+    # Tests a faire: service healthy, donnees persistantes, connexion BDD,
+    # routage HTTPS, acces video dans Moodle.
+    # NE PAS ACTIVER ce service sans ressources VM supplementaires.
+
+  # ------------------------------------------------------------------------
+  # SECTION BONUS - REDIS (cache/sessions) : NON DEPLOYE
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/redis/docker-compose.yml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # REDIS - BONUS (cache ou sessions selon compatibilite de l application).
+    # EMPLACEMENT RESERVE : pas de conteneur lance depuis ce fichier.
+    # Redis est une base cle/valeur en memoire: PAS de base PostgreSQL a creer.
+    # Secret deja prepare: /opt/GroupeC/secrets/redis_password.
+    # Lors de l integration utiliser AUTH/ACL sans exposer le mot de passe
+    # dans le compose, les journaux ou GitHub.
+    # Connexions autorisees: clients applicatifs seulement sur GroupeC-donnees.
+    # Port INTERNE 6379, ne jamais definir de port hote public "6379:6379".
+    # Prevoir limites RAM, controle de sante et persistence uniquement si utile.
+    # Reseau Compose a reutiliser:
+    # networks:
+    #   donnees:
+    #     external: true
+    #     name: GroupeC-donnees
+    # Pas de route Traefik: Redis n est pas une application HTTP publique.
+
+  # ------------------------------------------------------------------------
+  # LOKI 3.5.5 : stockage centralise de journaux
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/observabilite/loki/docker-compose.yml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # ==================================================
+    # CONFIGURATION ACTIVE - LOKI
+    # Responsable : observabilite GroupeC
+    # ==================================================
+
+    name: groupec-loki
+
+    services:
+      loki:
+        image: grafana/loki:3.5.5
+        container_name: groupec-loki
+        restart: unless-stopped
+        security_opt:
+          - no-new-privileges:true
+        logging:
+          driver: "json-file"
+          options:
+            max-size: "10m"
+            max-file: "3"
+
+        command:
+          - -config.file=/etc/loki/loki-config.yaml
+
+        volumes:
+          - ./loki-config.yaml:/etc/loki/loki-config.yaml:ro
+          - loki_data:/loki
+
+        networks:
+          - observabilite
+
+        mem_limit: 768m
+
+    volumes:
+      loki_data:
+
+    networks:
+      observabilite:
+        external: true
+        name: GroupeC-observabilite
+  # ------------------------------------------------------------------------
+  # LOKI : configuration TSDB, retention 7 jours
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/observabilite/loki/loki-config.yaml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    auth_enabled: false
+
+    server:
+      http_listen_port: 3100
+
+    common:
+      instance_addr: 127.0.0.1
+      path_prefix: /loki
+      storage:
+        filesystem:
+          chunks_directory: /loki/chunks
+          rules_directory: /loki/rules
+      replication_factor: 1
+      ring:
+        kvstore:
+          store: inmemory
+
+    schema_config:
+      configs:
+        - from: "2024-01-01"
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: index_
+            period: 24h
+
+    limits_config:
+      retention_period: 168h
+      allow_structured_metadata: true
+
+    compactor:
+      working_directory: /loki/compactor
+      retention_enabled: true
+      delete_request_store: filesystem
+
+  # ------------------------------------------------------------------------
+  # ALLOY 1.10.2 : lecture des journaux Docker Rootless
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/observabilite/alloy/docker-compose.yml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    name: groupec-alloy
+
+    services:
+      alloy:
+        image: grafana/alloy:v1.10.2
+        container_name: groupec-alloy
+        # UID 0 ici = utilisateur ubuntu de l'hote via Docker Rootless (PAS root de l'hote).
+        # Ce choix permet la lecture des journaux rootless en 0640; pas de mode privileged.
+        user: "0:0"
+        restart: unless-stopped
+        security_opt:
+          - no-new-privileges:true
+        logging:
+          driver: "json-file"
+          options:
+            max-size: "10m"
+            max-file: "3"
+
+        command:
+          - run
+          - /etc/alloy/config.alloy
+          - --storage.path=/var/lib/alloy/data
+
+        volumes:
+          - ./config.alloy:/etc/alloy/config.alloy:ro
+          - /home/ubuntu/.local/share/docker/containers:/journaux:ro
+          - alloy_data:/var/lib/alloy/data
+
+        networks:
+          - observabilite
+
+        mem_limit: 512m
+
+    volumes:
+      alloy_data:
+
+    networks:
+      observabilite:
+        external: true
+        name: GroupeC-observabilite
+  # ------------------------------------------------------------------------
+  # ALLOY : pipeline json-file vers Loki
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/observabilite/alloy/config.alloy
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    local.file_match "docker_logs" {
+      path_targets = [
+        {
+          __path__ = "/journaux/*/*-json.log",
+          job      = "docker-rootless",
+        },
+      ]
+    }
+
+    loki.source.file "docker_logs" {
+      targets    = local.file_match.docker_logs.targets
+      forward_to = [loki.process.docker_json.receiver]
+    }
+
+    loki.process "docker_json" {
+      stage.json {
+        expressions = {
+          message = "log",
+          stream  = "stream",
+          time    = "time",
+        }
+      }
+
+      stage.timestamp {
+        source = "time"
+        format = "RFC3339Nano"
+      }
+
+      stage.output {
+        source = "message"
+      }
+
+      stage.labels {
+        values = {
+          stream = "",
+        }
+      }
+
+      forward_to = [loki.write.local.receiver]
+    }
+
+    loki.write "local" {
+      endpoint {
+        url = "http://groupec-loki:3100/loki/api/v1/push"
+      }
+    }
+
+  # ------------------------------------------------------------------------
+  # GRAFANA 12.3.0 : HTTPS via Traefik, secret local
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/observabilite/grafana/docker-compose.yml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # ==================================================
+    # CONFIGURATION ACTIVE - GRAFANA
+    # Projet CR465 - GroupeC
+    # ==================================================
+
+    name: groupec-grafana
+
+    services:
+      grafana:
+        image: grafana/grafana:12.3.0
+        container_name: groupec-grafana
+        restart: unless-stopped
+        security_opt:
+          - no-new-privileges:true
+        logging:
+          driver: "json-file"
+          options:
+            max-size: "10m"
+            max-file: "3"
+
+        user: "472:0"
+        group_add:
+          - "1000"
+
+        environment:
+          GF_SECURITY_ADMIN_USER: admin
+          GF_SERVER_ROOT_URL: "https://grafana.groupec.test:4443/"
+          GF_SECURITY_COOKIE_SECURE: "true"
+          GF_AUTH_ANONYMOUS_ENABLED: "false"
+          GF_USERS_ALLOW_SIGN_UP: "false"
+          GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+
+        volumes:
+          - grafana_data:/var/lib/grafana
+          - ./provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+          - /opt/GroupeC/secrets/grafana_admin_password:/run/secrets/grafana_admin_password:ro
+
+        networks:
+          - applicatif
+          - observabilite
+
+        mem_limit: 512m
+
+    volumes:
+      grafana_data:
+
+    networks:
+      applicatif:
+        external: true
+        name: GroupeC-applicatif
+
+      observabilite:
+        external: true
+        name: GroupeC-observabilite
+  # ------------------------------------------------------------------------
+  # GRAFANA : datasource Loki configuree automatiquement
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/observabilite/grafana/provisioning/datasources/loki.yml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    apiVersion: 1
+
+    datasources:
+      - name: Loki
+        uid: loki
+        type: loki
+        access: proxy
+        url: http://groupec-loki:3100
+        isDefault: true
+        editable: false
+
+  # ------------------------------------------------------------------------
+  # SECTION BONUS +2 POINTS - OPENAPPSEC (WAF local) : NON DEPLOYE
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/OpenAppsec/docker-compose.yml
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # OPENAPPSEC - WAF BONUS +2 POINTS, mode LOCAL / STANDALONE exclusivement.
+    # EMPLACEMENT RESERVE : PAS une installation fonctionnelle du WAF.
+    # Doit proteger l entree HTTP(S) en lien avec Traefik, sans dependre du
+    # tableau de bord SaaS Check Point Infinity.
+    # Le vrai montage exige le Compose/agent correspondant a la version
+    # de Traefik et au profil standalone de l editeur.
+    # Prevoir fichier de politique locale, par exemple:
+    #   /opt/GroupeC/OpenAppsec/local_policy.yaml
+    # et montage de politique dans l agent (emplacement adapte a l image).
+    # IMPORTANT: le Traefik initial utilise le fournisseur de fichiers
+    # (aucun Docker socket). Etudier la methode officielle d integration WAF
+    # avant de modifier ce choix de securite.
+    # Aucun jeton SaaS, aucun mot de passe fixe dans GitHub.
+    # Reseau: GroupeC-exposition en frontal / point d entree selon montage;
+    # ne PAS connecter WAF directement a PostgreSQL (GroupeC-donnees).
+    # Tests requis pour le bonus: trafic normal OK, requete malveillante
+    # de laboratoire detectee ou bloquee, journaux et regles locales visibles.
+    # En cas de difficulte, laisser DESACTIVE : ce composant n est PAS requis.
+
+  # ------------------------------------------------------------------------
+  # FICHIER EXEMPLE ENV - ne contient aucun mot de passe
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/.env.example
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    # Exemple partageable : aucune valeur secrete n est incluse.
+    # Les mots de passe sont generes localement par /opt/GroupeC/deploy.sh.
+    POSTGRES_HOST=postgres
+    POSTGRES_PORT=5432
+    MOODLE_DB=moodle
+    MOODLE_USER=moodle
+    KEYCLOAK_DB=keycloak
+    KEYCLOAK_USER=keycloak
+    DRUPAL_DB=drupal
+    DRUPAL_USER=drupal
+    N8N_DB=n8n
+    N8N_USER=n8n
+    OPENCAST_DB=opencast
+    OPENCAST_USER=opencast
+    # REDIS utilise son propre secret local, sans instance PostgreSQL.
+    # GRAFANA et LOKI: pas de base SQL supplementaire prevue.
+    # Les images ne supportent pas toutes *_PASSWORD_FILE: adapter service par service.
+
+  # ------------------------------------------------------------------------
+  # ETAPE 3 - deploiement et VERIFICATIONS automatiques jusqu a PostgreSQL
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/deploy.sh
+  owner: root:root
+  permissions: !!str "0755"
+  content: |
+    #!/usr/bin/env bash
+    # CR465 - Deploiement Rootless reproductible, base commune GroupeC.
+    # Etape 3 de runcmd: seulement apres installation et activation de Rootless.
+    set -euo pipefail
+    DOCKER_USER=ubuntu
+    USER_ID="$(id -u "$DOCKER_USER")"
+    RUNTIME_DIR="/run/user/${USER_ID}"
+    BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
+    ROOT=/opt/GroupeC
+
+    user_docker() {
+      runuser -u "$DOCKER_USER" -- env \
+        HOME="/home/${DOCKER_USER}" USER="$DOCKER_USER" LOGNAME="$DOCKER_USER" \
+        XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+        DBUS_SESSION_BUS_ADDRESS="$BUS_ADDRESS" \
+        DOCKER_HOST="unix://${RUNTIME_DIR}/docker.sock" \
+        PATH="/usr/local/bin:/usr/bin:/bin" docker "$@"
+    }
+
+    # Bloquer tout deploiement si Docker rootful a ete utilise par erreur.
+    user_docker info --format '{{json .SecurityOptions}}' | grep -q rootless || {
+      echo 'ERREUR: Docker Rootless inactif' >&2; exit 1;
+    }
+
+    # Securite SSH: la cle du compte ubuntu est injectee par Multipass.
+    # Aucune cle publique ni aucun mot de passe n est integre au YAML.
+    /usr/sbin/sshd -t
+    systemctl is-active --quiet ssh || { echo 'ERREUR: SSH inactif' >&2; exit 1; }
+
+    # Toute la structure sous /opt/GroupeC (et non /opt/<service>).
+    for folder in traefik traefik/dynamic traefik/certs traefik/auth \
+      postgresql postgresql/initdb webtest moodle keycloak drupal n8n \
+      portainer opencast redis observabilite observabilite/loki observabilite/alloy \
+      observabilite/grafana observabilite/grafana/provisioning \
+      observabilite/grafana/provisioning/datasources OpenAppsec secrets; do
+      install -d -m 0755 "$ROOT/$folder"
+    done
+
+    # Secrets generes SUR LA VM, jamais dans le YAML, .env, GitHub ou la video.
+    # Mots de passe SQL pour 5 services, plus dashboard/Portainer/Redis/Grafana.
+    # Redis, Loki et Grafana ne requierent pas de base PostgreSQL dans ce projet.
+    install -d -o ubuntu -g ubuntu -m 0700 "$ROOT/secrets"
+    for secret in postgres_admin_password moodle_db_password keycloak_db_password drupal_db_password n8n_db_password opencast_db_password traefik_dashboard_password portainer_admin_password redis_password grafana_admin_password; do
+      file="$ROOT/secrets/$secret"
+      if [ ! -s "$file" ]; then
+        ( umask 077; openssl rand -hex 32 > "$file" )
+      fi
+      chown ubuntu:ubuntu "$file"
+      # PostgreSQL lit les montages secrets via un UID interne different.
+      # Le parent prive 0700 empeche la lecture par les autres comptes de la VM.
+      chmod 0644 "$file"
+    done
+    chmod 0600 "$ROOT/secrets/traefik_dashboard_password"
+    chmod 0600 "$ROOT/secrets/portainer_admin_password"
+    # Compatible avec Grafana user 472:0 sous Docker Rootless : lecture via groupe 0.
+    # Verifier a nouveau par un test de lecture apres deploiement.
+    chmod 0640 "$ROOT/secrets/grafana_admin_password"
+
+    # -----------------------------------------------------------------------
+    # Keycloak / Moodle : secrets nouveaux, controles et idempotents.
+    # Ces fichiers restent uniquement sur la VM (jamais dans ce cloud-init).
+    # -----------------------------------------------------------------------
+    install -d -m 0700 -o ubuntu -g ubuntu "$ROOT/moodle" "$ROOT/keycloak"
+    for s in moodle_admin_password keycloak_admin_password moodle_oidc_client_secret keycloak_permanent_admin_password etudiant_test_password; do
+      f="$ROOT/secrets/$s"
+      if [ ! -s "$f" ]; then
+        ( umask 077; openssl rand -hex 32 > "$f" )
+      fi
+      chown ubuntu:ubuntu "$f"
+      chmod 0600 "$f"
+    done
+    # Moodle Alpine utilise DB_PASS, pas DB_PASS_FILE.
+    # Format .env lisible par Compose, restreint a ubuntu.
+    ( umask 077
+      printf 'MOODLE_USERNAME=admin\nMOODLE_EMAIL=admin@groupec.test\nMOODLE_PASSWORD=%s\nDB_PASS=%s\n' \
+        "$(cat "$ROOT/secrets/moodle_admin_password")" \
+        "$(cat "$ROOT/secrets/moodle_db_password")" > "$ROOT/moodle/.env"
+      printf 'KC_DB_PASSWORD=%s\nKC_BOOTSTRAP_ADMIN_PASSWORD=%s\n' \
+        "$(cat "$ROOT/secrets/keycloak_db_password")" \
+        "$(cat "$ROOT/secrets/keycloak_admin_password")" > "$ROOT/keycloak/.env"
+    )
+    chown ubuntu:ubuntu "$ROOT/moodle/.env" "$ROOT/keycloak/.env"
+    chmod 0600 "$ROOT/moodle/.env" "$ROOT/keycloak/.env"
+    # Inserer le secret OIDC dans l'import Keycloak, jamais dans GitHub.
+    # Conserver le meme secret/realm sur les executions suivantes.
+    if [ ! -s "$ROOT/keycloak/groupec-realm.json" ]; then
+      ( umask 077
+        jq --arg sec "$(cat "$ROOT/secrets/moodle_oidc_client_secret")" \
+          '.clients |= map(if .clientId == "moodle" then .secret = $sec else . end)' \
+          "$ROOT/keycloak/groupec-realm.template.json" \
+          > "$ROOT/keycloak/groupec-realm.json"
+      )
+    fi
+    chown ubuntu:ubuntu "$ROOT/keycloak/groupec-realm.json"
+    # L'UID non-root de Keycloak doit pouvoir lire le montage RO.
+    # Repertoire parent prive 0700 bloque les autres utilisateurs de la VM.
+    chmod 0644 "$ROOT/keycloak/groupec-realm.json"
+
+    # Certificat autosigne HTTPS: local au laboratoire, 365 jours.
+    # SAN explicites : curl ne fait pas correspondre *.localhost aux hotes locaux.
+    # IMPORTANT: le fichier de cle est lisible par le conteneur Traefik rootless.
+    install -d -m 0700 -o ubuntu -g ubuntu "$ROOT/traefik/certs"
+    if [ ! -s "$ROOT/traefik/certs/local.crt" ] || [ ! -s "$ROOT/traefik/certs/local.key" ]; then
+      openssl req -x509 -nodes -days 365 -newkey rsa:3072 -sha256 \
+        -keyout "$ROOT/traefik/certs/local.key" \
+        -out "$ROOT/traefik/certs/local.crt" \
+        -subj '/CN=demo.localhost' \
+        -addext 'subjectAltName=DNS:localhost,DNS:demo.localhost,DNS:dashboard.localhost,DNS:portainer.localhost,DNS:portainer.groupec.test,DNS:grafana.groupec.test,DNS:moodle.groupec.test,DNS:keycloak.groupec.test,DNS:moodle.localhost,DNS:keycloak.localhost,IP:127.0.0.1' \
+        >/dev/null 2>&1
+    fi
+    chown ubuntu:ubuntu "$ROOT/traefik/certs/local.crt" "$ROOT/traefik/certs/local.key"
+    chmod 0644 "$ROOT/traefik/certs/local.crt"
+    chmod 0600 "$ROOT/traefik/certs/local.key"
+    cat /etc/ssl/certs/ca-certificates.crt "$ROOT/traefik/certs/local.crt" > "$ROOT/moodle/ca-bundle.crt"
+    chown ubuntu:ubuntu "$ROOT/moodle/ca-bundle.crt"
+    chmod 0644 "$ROOT/moodle/ca-bundle.crt"
+
+    # Dashboard Traefik : protection BasicAuth par hash BCrypt, mot de passe secret.
+    install -d -m 0700 -o ubuntu -g ubuntu "$ROOT/traefik/auth"
+    if [ ! -s "$ROOT/traefik/auth/users.htpasswd" ]; then
+      htpasswd -iBc "$ROOT/traefik/auth/users.htpasswd" admin < "$ROOT/secrets/traefik_dashboard_password" >/dev/null
+    fi
+    chown ubuntu:ubuntu "$ROOT/traefik/auth/users.htpasswd"
+    chmod 0600 "$ROOT/traefik/auth/users.htpasswd"
+
+    # 4 reseaux communs EXTERNES: separation des flux.
+    # Reseau applicatif fixe pour que la resolution Keycloak->Traefik soit stable.
+    # Le sous-reseau choisi ne doit pas chevaucher un reseau VPN ou de l'hote.
+    for network in GroupeC-exposition; do
+      if ! user_docker network inspect "$network" >/dev/null 2>&1; then
+        user_docker network create --driver bridge "$network"
+      fi
+    done
+    if ! user_docker network inspect GroupeC-applicatif >/dev/null 2>&1; then
+      user_docker network create --driver bridge --subnet 172.28.240.0/24 GroupeC-applicatif
+    fi
+    app_subnet="$(user_docker network inspect GroupeC-applicatif --format '{{(index .IPAM.Config 0).Subnet}}')"
+    [ "$app_subnet" = '172.28.240.0/24' ] || {
+      echo 'ERREUR: GroupeC-applicatif doit avoir le sous-reseau 172.28.240.0/24 pour le SSO' >&2; exit 1;
+    }
+    if ! user_docker network inspect GroupeC-donnees >/dev/null 2>&1; then
+      user_docker network create --driver bridge --internal GroupeC-donnees
+    fi
+    [ "$(user_docker network inspect GroupeC-donnees --format '{{.Internal}}')" = true ] || {
+      echo 'ERREUR: reseau GroupeC-donnees non internal' >&2; exit 1;
+    }
+    # Nouveau reseau reserve a Grafana/Loki/Alloy; Loki/Alloy non exposes sur l'hote.
+    if ! user_docker network inspect GroupeC-observabilite >/dev/null 2>&1; then
+      user_docker network create --driver bridge --internal GroupeC-observabilite
+    fi
+    [ "$(user_docker network inspect GroupeC-observabilite --format '{{.Internal}}')" = true ] || {
+      echo 'ERREUR: reseau GroupeC-observabilite non internal' >&2; exit 1;
+    }
+    # Empreinte du chemin exact valide sur la base Docker Rootless de ubuntu.
+    [ "$(user_docker info --format '{{.DockerRootDir}}')" = /home/ubuntu/.local/share/docker ] || {
+      echo 'ERREUR: DockerRootDir different du montage de journaux attendu par Alloy' >&2; exit 1;
+    }
+    # Ne pas modifier le repertoire des journaux gere par Docker.
+
+    # Verifier la configuration des 7 projets Compose avant demarrage.
+    for service in postgresql traefik webtest portainer; do
+      user_docker compose -f "$ROOT/$service/docker-compose.yml" config --quiet
+    done
+
+    for service in loki alloy grafana; do
+      user_docker compose -f "$ROOT/observabilite/$service/docker-compose.yml" config --quiet
+    done
+
+    # Les deux services sont maintenant valides avec les 7 projets de base.
+    for service in moodle keycloak; do
+      user_docker compose -f "$ROOT/$service/docker-compose.yml" config --quiet
+    done
+    # Drupal et n8n restent des emplacements reserves non deployes.
+
+    # Les gabarits applicatifs restent commentes; Portainer et observabilite ajoutes.
+    user_docker compose -f "$ROOT/postgresql/docker-compose.yml" up -d
+    user_docker compose -f "$ROOT/traefik/docker-compose.yml" up -d
+    user_docker compose -f "$ROOT/webtest/docker-compose.yml" up -d
+    user_docker compose -f "$ROOT/portainer/docker-compose.yml" up -d
+
+    # Validation Portainer via Traefik: conteneur running et API HTTP 200.
+    portainer_ready=no
+    for i in $(seq 1 45); do
+      if user_docker compose -f "$ROOT/portainer/docker-compose.yml" ps --status running --services | grep -qx portainer; then
+        http_code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+          --cacert "$ROOT/traefik/certs/local.crt" \
+          --resolve portainer.localhost:4443:127.0.0.1 \
+          https://portainer.localhost:4443/api/system/status || true)"
+        if [ "$http_code" = 200 ]; then
+          portainer_ready=yes
+          break
+        fi
+      fi
+      sleep 2
+    done
+    [ "$portainer_ready" = yes ] || {
+      echo 'ERREUR: Portainer ou son routage HTTPS ne repond pas (HTTP 200 attendu)' >&2; exit 1;
+    }
+
+    # Portainer ne doit PAS publier de port hote ni rejoindre le reseau de donnees.
+    portainer_id="$(user_docker compose -f "$ROOT/portainer/docker-compose.yml" ps -q portainer)"
+    [ -n "$portainer_id" ] || { echo 'ERREUR: conteneur Portainer introuvable' >&2; exit 1; }
+    [ -z "$(user_docker port "$portainer_id")" ] || {
+      echo 'ERREUR: Portainer publie un port direct sur la VM' >&2; exit 1;
+    }
+    user_docker inspect -f '{{json .NetworkSettings.Networks}}' "$portainer_id" | grep -q GroupeC-applicatif || {
+      echo 'ERREUR: Portainer absent du reseau applicatif' >&2; exit 1;
+    }
+    if user_docker inspect -f '{{json .NetworkSettings.Networks}}' "$portainer_id" | grep -q GroupeC-donnees; then
+      echo 'ERREUR: Portainer ne doit pas rejoindre le reseau de donnees' >&2; exit 1;
+    fi
+
+    # Attendre les cinq bases (Opencast optionnel compris) ET leurs proprietaires.
+    ready=no
+    for i in $(seq 1 90); do
+      count="$(user_docker compose -f "$ROOT/postgresql/docker-compose.yml" exec -T postgres \
+        psql -U postgres -d postgres -tAc \
+        "SELECT count(*) FROM pg_database WHERE datname IN ('moodle','keycloak','drupal','n8n','opencast')" 2>/dev/null || true)"
+      if [ "$count" = 5 ]; then ready=yes; break; fi
+      sleep 2
+    done
+    [ "$ready" = yes ] || { echo 'ERREUR: PostgreSQL n a pas cree les 5 bases' >&2; exit 1; }
+
+    # Verifier que les cinq roles se sont vus attribuer leur propre base.
+    correct_owners="$(user_docker compose -f "$ROOT/postgresql/docker-compose.yml" exec -T postgres \
+      psql -U postgres -d postgres -tAc \
+      "SELECT count(*) FROM pg_database WHERE datname IN ('moodle','keycloak','drupal','n8n','opencast') AND datname=pg_get_userbyid(datdba)" 2>/dev/null || true)"
+    [ "$correct_owners" = 5 ] || { echo 'ERREUR: proprietaires des bases non conformes' >&2; exit 1; }
+
+    # 1) Ping Traefik; 2) HTTPS Nginx; 3) dashboard refuse les anonymes.
+    # --resolve evite de dependre de la resolution .localhost dans la VM.
+    ready=no
+    for i in $(seq 1 45); do
+      if curl --noproxy '*' -fsS http://127.0.0.1:8080/ping | grep -qx OK && \
+         curl --noproxy '*' -fsS --cacert "$ROOT/traefik/certs/local.crt" \
+           --resolve demo.localhost:4443:127.0.0.1 \
+           https://demo.localhost:4443/ | grep -qi 'Welcome to nginx' && \
+         [ "$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+           --cacert "$ROOT/traefik/certs/local.crt" \
+           --resolve dashboard.localhost:4443:127.0.0.1 \
+           https://dashboard.localhost:4443/dashboard/)" = 401 ]; then
+        ready=yes; break
+      fi
+      sleep 2
+    done
+    [ "$ready" = yes ] || {
+      echo 'ERREUR: validation Traefik HTTPS, ping ou dashboard protegee' >&2; exit 1;
+    }
+
+    [ -d /home/ubuntu/.local/share/docker/containers ] || {
+      echo 'ERREUR: repertoire de journaux Rootless absent' >&2; exit 1;
+    }
+    # OBSERVABILITE : demarrer Loki et attendre sa disponibilite.
+    user_docker compose -f "$ROOT/observabilite/loki/docker-compose.yml" up -d
+
+    # Attendre HTTP 200 sur /ready avant de demarrer Alloy et Grafana.
+    # Loki reste accessible uniquement sur le reseau Docker interne.
+    if ! user_docker run --rm --network GroupeC-observabilite \
+        --entrypoint sh curlimages/curl:8.11.1 -c '
+          i=0
+          until curl --noproxy "*" -fsS -o /dev/null http://groupec-loki:3100/ready 2>/dev/null; do
+            i=$((i + 1))
+            if [ "$i" -ge 90 ]; then
+              echo "ERREUR: Loki non pret apres 180 secondes" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "SUCCES: Loki est pret (HTTP 200 sur /ready)"
+        '; then
+      echo "ERREUR: Loki indisponible, deploiement interrompu" >&2
+      exit 1
+    fi
+
+    # Loki est pret : demarrer Alloy puis Grafana.
+    for service in alloy grafana; do
+      user_docker compose -f "$ROOT/observabilite/$service/docker-compose.yml" up -d
+    done
+
+    # Verifier que les trois conteneurs restent actifs (et non seulement "created").
+    for service in loki alloy grafana; do
+      container="groupec-$service"
+      running=no
+      for i in $(seq 1 45); do
+        if [ "$(user_docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)" = true ]; then
+          running=yes; break
+        fi
+        sleep 2
+      done
+      [ "$running" = yes ] || { echo "ERREUR: $container pas en cours d'execution" >&2; exit 1; }
+    done
+    # Acces a Grafana par Traefik en HTTPS (sans ouvrir le port 3000 de Grafana).
+    grafana_ready=no
+    for i in $(seq 1 90); do
+      code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+        --cacert "$ROOT/traefik/certs/local.crt" \
+        --resolve grafana.groupec.test:4443:127.0.0.1 \
+        https://grafana.groupec.test:4443/login || true)"
+      if [ "$code" = 200 ]; then grafana_ready=yes; break; fi
+      sleep 2
+    done
+    [ "$grafana_ready" = yes ] || {
+      echo 'ERREUR: page Grafana /login inaccessible via Traefik en HTTPS' >&2; exit 1;
+    }
+    # La verification d'acces aux fichiers par Alloy, de Loki et de la datasource
+    # Grafana demande un test de bout en bout APRES installation, voir README.
+    echo 'SUCCES: base Rootless/Traefik/PostgreSQL/Portainer validee; Loki, Alloy et Grafana demarres, Grafana HTTPS 200.'
+    # -----------------------------------------------------------------------
+    # KEYCLOAK / MOODLE : nouveaux services, seulement apres les 7 de base.
+    # En cas d'echec, aucun conteneur existant n'est recree/supprime ici.
+    # -----------------------------------------------------------------------
+    user_docker compose -f "$ROOT/keycloak/docker-compose.yml" up -d
+    # Keycloak peut reconstruire sa configuration au premier lancement.
+    # KEYCLOAK: maximum 8 minutes de disponibilite au premier demarrage.
+    # Chaque tentative est limitee a 15 s et la connexion a 5 s.
+    keycloak_ready=no
+    keycloak_deadline=$((SECONDS + 480))
+    while (( SECONDS < keycloak_deadline )); do
+      code="$(curl --noproxy '*' --connect-timeout 5 --max-time 15 -sS -o /dev/null -w '%{http_code}' \
+        --cacert "$ROOT/traefik/certs/local.crt" \
+        --resolve keycloak.groupec.test:4443:127.0.0.1 \
+        https://keycloak.groupec.test:4443/realms/groupec/.well-known/openid-configuration || true)"
+      if [ "$code" = 200 ]; then keycloak_ready=yes; break; fi
+      sleep 3
+    done
+    [ "$keycloak_ready" = yes ] || {
+      echo 'ERREUR: timeout Keycloak: indisponible apres 480 secondes (inspecter docker logs)' >&2; exit 1;
+    }
+    # Valider le meme URL public depuis un conteneur du reseau applicatif.
+    # L'alias reseau Traefik resout keycloak.groupec.test dans Docker.
+    user_docker run --rm --network GroupeC-applicatif         -v "$ROOT/traefik/certs/local.crt:/tmp/groupec-ca.crt:ro"         curlimages/curl:8.11.1 -fsS --connect-timeout 5 --max-time 15 --cacert /tmp/groupec-ca.crt         -o /dev/null         https://keycloak.groupec.test:4443/realms/groupec/.well-known/openid-configuration || {
+        echo 'ERREUR: Keycloak OIDC inaccessible depuis le reseau applicatif' >&2; exit 1;
+      }
+    # Verifier le flux OIDC et la confidentialite : aucun port direct.
+    kc_id="$(user_docker compose -f "$ROOT/keycloak/docker-compose.yml" ps -q keycloak)"
+    [ -n "$kc_id" ] && [ -z "$(user_docker port "$kc_id")" ] || {
+      echo 'ERREUR: exposition directe de Keycloak' >&2; exit 1;
+    }
+    user_docker inspect -f '{{json .NetworkSettings.Networks}}' "$kc_id" | grep -q GroupeC-donnees || {
+      echo 'ERREUR: Keycloak absent du reseau donnees' >&2; exit 1;
+    }
+    # Resolution locale (VM seulement) : le DNS Docker des conteneurs n'est pas modifie.
+    # URL et SNI restent keycloak.groupec.test; le certificat autosigne est controle.
+    if ! grep -Eq '^127\.0\.0\.1[[:space:]]+keycloak\.groupec\.test([[:space:]]|$)' /etc/hosts; then
+      printf '%s\n' '127.0.0.1 keycloak.groupec.test' >> /etc/hosts
+    fi
+    getent ahostsv4 keycloak.groupec.test | grep -q '^127\.0\.0\.1[[:space:]]' || {
+      echo 'ERREUR: le domaine Keycloak ne resout pas vers 127.0.0.1 sur la VM' >&2; exit 1;
+    }
+    # Keycloak : administrateur permanent, verification effective des droits,
+    # suppression bootstrap UNIQUEMENT apres re-authentification reussie;
+    # etudiant-test (password genere et stocke sur la VM).
+    python3 "$ROOT/keycloak/provision-users.py"
+    # La base Moodle est deja creee et verifiee par la partie PostgreSQL.
+    user_docker compose -f "$ROOT/moodle/docker-compose.yml" up -d
+    # MOODLE: maximum 15 minutes au premier boot (installation SQL initiale).
+    # Connexion limitee a 5 s et chaque requete a 15 s.
+    moodle_ready=no
+    moodle_deadline=$((SECONDS + 900))
+    while (( SECONDS < moodle_deadline )); do
+      code="$(curl --noproxy '*' --connect-timeout 5 --max-time 15 -L --max-redirs 5 -sS -o /dev/null -w '%{http_code}' \
+        --cacert "$ROOT/traefik/certs/local.crt" \
+        --resolve moodle.groupec.test:4443:127.0.0.1 \
+        https://moodle.groupec.test:4443/login/index.php || true)"
+      if [ "$code" = 200 ]; then moodle_ready=yes; break; fi
+      sleep 5
+    done
+    [ "$moodle_ready" = yes ] || {
+      echo 'ERREUR: timeout Moodle: login indisponible apres 900 secondes (inspecter docker logs)' >&2; exit 1;
+    }
+    moodle_id="$(user_docker compose -f "$ROOT/moodle/docker-compose.yml" ps -q moodle)"
+    [ -n "$moodle_id" ] && [ -z "$(user_docker port "$moodle_id")" ] || {
+      echo 'ERREUR: exposition directe de Moodle' >&2; exit 1;
+    }
+    [ "$(user_docker exec "$moodle_id" id -u)" != 0 ] || {
+      echo 'ERREUR: Moodle n execute pas l utilisateur attendu non-root' >&2; exit 1;
+    }
+    user_docker inspect -f '{{json .HostConfig.SecurityOpt}}' "$moodle_id" | grep -q no-new-privileges || {
+      echo 'ERREUR: durcissement Moodle absent' >&2; exit 1;
+    }
+    # Regler les parametres de securite Moodle apres installation SQL.
+    moodle_cfg="$(user_docker exec "$moodle_id" sh -c 'find /var/www/html -path "*/admin/cli/cfg.php" | head -1')"
+    if [ -n "$moodle_cfg" ]; then
+      for kv in forcelogin=1 cookiesecure=1 passwordpolicy=1 \
+        lockoutthreshold=5 lockoutwindow=1800 lockoutduration=1800 \
+        sessiontimeout=7200 webserviceprotocols=rest auth=email,oauth2; do
+        user_docker exec "$moodle_id" php "$moodle_cfg" --name="${kv%%=*}" --set="${kv#*=}"
+      done
+      # Verifier que le plugin OAuth2 est active sans desactiver la methode email.
+      user_docker exec "$moodle_id" php -r \
+        'define("CLI_SCRIPT", true); require "/var/www/html/config.php"; $methods = array_map("trim", explode(",", $CFG->auth ?? "")); if (!in_array("email", $methods, true) || !in_array("oauth2", $methods, true)) { fwrite(STDERR, "ERREUR: auth=email,oauth2 non applique\n"); exit(1); } echo "SUCCES: methodes email et oauth2 activees\n";'
+    else
+      echo 'AVERTISSEMENT: cfg.php absent ; parametres Moodle a regler dans l admin' >&2
+    fi
+    # Definir les ports cURL autorises (80/443/4443) sans desactiver la protection
+    # SSRF: retrait uniquement de l'IP Traefik Keycloak des CIDR prives bloques.
+    # Cette IP est fixe via Compose et verifiee contre DNS depuis Moodle.
+    traefik_id="$(user_docker compose -f "$ROOT/traefik/docker-compose.yml" ps -q traefik)"
+    proxy_ip="$(user_docker inspect "$traefik_id" --format '{{(index .NetworkSettings.Networks "GroupeC-applicatif").IPAddress}}')"
+    [ "$proxy_ip" = 172.28.240.10 ] || { echo 'ERREUR: IP interne Traefik inattendue' >&2; exit 1; }
+    user_docker exec "$moodle_id" php /opt/groupec-configure-curl-oidc.php "$proxy_ip"
+    # SSO automatique : secret lu via stdin, jamais publie dans le YAML ou les journaux.
+    # Executer seulement une fois Moodle installe et Keycloak disponible.
+    # La commande est idempotente : pas de doublon si on rejoue deploy.sh.
+    user_docker exec -i "$moodle_id" php /opt/groupec-configure-sso.php \
+      < "$ROOT/secrets/moodle_oidc_client_secret"
+    # Configuration automatique du cours, du quiz et de l API Moodle.
+      user_docker exec -i "$moodle_id" php \
+        < "$ROOT/moodle/configure-moodle.php"
+
+      echo 'SUCCES: cours, quiz et configuration API Moodle automatises.' 
+
+    echo 'SUCCES: Keycloak OIDC HTTP 200, Moodle HTTPS/login HTTP 200, sans ports hote directs.'
+    echo 'SSO: fournisseur Moodle OAuth2 cree automatiquement; tester une connexion utilisateur reelle depuis le navigateur.'
+
+    echo 'A VERIFIER: lecture reelle des json-file par Alloy et requetes Grafana -> Loki.'
+    echo 'NOTE: Drupal et n8n restent a integrer; SSO: fournisseur cree automatiquement; confirmer la connexion interactive sur navigateur.'
+
+    # Verifier que le bouton de connexion OIDC est rendu, sans authentification.
+    if ! curl --noproxy '*' --connect-timeout 5 --max-time 30 -fsS \
+        --cacert "$ROOT/traefik/certs/local.crt" \
+        --resolve moodle.groupec.test:4443:127.0.0.1 \
+        https://moodle.groupec.test:4443/login/index.php \
+        | grep -q 'Keycloak Groupe C'; then
+      echo 'ERREUR: bouton Keycloak non present sur la page Moodle' >&2
+      exit 1
+    fi
+    echo 'SUCCES: configuration SSO Moodle + Keycloak et bouton de connexion verifies automatiquement.'
+
+  # ------------------------------------------------------------------------
+  # MODE D EMPLOI - collegues, reseaux, secrets, tests
+  # ------------------------------------------------------------------------
+- path: /opt/GroupeC/README-SSO.txt
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    SSO Moodle / Keycloak Groupe C — AUTOMATISE
+    ============================================
+    Sur VM neuve, cloud-init configure Keycloak, Moodle OAuth2, les 3 endpoints,
+    les 3 mappings etudiant, ports cURL et le blocage SSRF restant, ainsi que le
+    compte etudiant-test et un administrateur permanent groupec-admin.
+    Credentials sur VM sous /opt/GroupeC/secrets (ne pas committer).
+    Le compte bootstrap admin est supprime APRES verification API des privileges.
+    Le bouton Log in with Keycloak Groupe C doit apparaitre sur Moodle.
+    Le test de navigateur Windows est indispensable: ./README-FINAL-CR465.txt.
+
+- path: /opt/GroupeC/README-INTEGRATION.txt
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    NOTE FINALE: Moodle-Keycloak SSO est automatise dans ce YAML ; voir README-FINAL-CR465.txt.
+
+    CR465 - BASE GROUPEC : FICHIER D INTEGRATION
+    ==============================================
+
+    ETAT DE LA BASE APRES UNE VM NEUVE:
+    - SSH installe, authentification par cle (Multipass injecte sa cle).
+    - Docker rootless (utilisateur ubuntu, demon systemd --user, linger).
+    - Docker Compose.
+    - Reseaux: GroupeC-exposition; GroupeC-applicatif; GroupeC-donnees (internal); GroupeC-observabilite (internal).
+    - Traefik HTTPS autosigne, file provider, aucun socket Docker monte.
+    - Tableau de bord: route dashboard.localhost, authentification BasicAuth.
+    - Nginx TEMPORAIRE webtest pour prouver le routage HTTPS.
+    - PostgreSQL 17, 5 bases et 5 comptes: moodle, keycloak, drupal, n8n, opencast.
+    - Opencast reste non installe, mais son role/sa base sont provisionnes.
+    - Portainer CE: service actif via Traefik; administration Docker Rootless.
+    - Secret admin Portainer au premier demarrage, conserve localement dans /opt/GroupeC/secrets/.
+    - Secret admin et secret distinct pour chaque compte SQL (PAS de valeur fixe).
+    - Mot de passe Redis reserve; mot de passe Grafana actif par fichier secret.
+    - Drupal et n8n ne sont pas encore deployes. Moodle et Keycloak sont ajoutes.
+
+    NOMS ET RESEAUX:
+    - GroupeC-exposition : Traefik seulement.
+    - GroupeC-applicatif : Traefik, Nginx, Portainer et futurs services web.
+    - GroupeC-donnees : PostgreSQL et applications ayant une BD.
+    - GroupeC-observabilite : Grafana, Loki et Alloy (internal).
+    - Les applications connectent a la BD via hote postgres:5432.
+    - Portainer et Traefik ne necessitent pas de bases PostgreSQL. Moodle/Keycloak utilisent les bases existantes.
+    - OpenAppSec WAF (+2 pts) et Redis sont BONUS; Opencast est OPTIONNEL.
+    - Grafana/Loki/Alloy: couche observabilite active et a valider de bout en bout.
+
+    CONFIGURATIONS COTE COLLEGUES (voir aussi /opt/GroupeC/README-SSO.txt):
+    - /opt/GroupeC/moodle/docker-compose.yml : ACTIF (Moodle 5.3).
+    - /opt/GroupeC/keycloak/docker-compose.yml : ACTIF (Keycloak 26.8.2).
+    - /opt/GroupeC/drupal/docker-compose.yml : ajouter vrai Compose + Commerce.
+    - /opt/GroupeC/n8n/docker-compose.yml : ajouter vrai Compose + workflow.
+    - /opt/GroupeC/portainer/docker-compose.yml : Portainer CE fonctionnel (Compose fourni).
+    - /opt/GroupeC/opencast/docker-compose.yml : OPTIONNEL, BDD opencast precree.
+    - /opt/GroupeC/redis/docker-compose.yml : BONUS cache, secret redis_password.
+    - /opt/GroupeC/observabilite/grafana/docker-compose.yml : ACTIF, HTTPS par Traefik.
+    - /opt/GroupeC/observabilite/loki/docker-compose.yml : ACTIF, stockage des logs.
+    - /opt/GroupeC/observabilite/alloy/docker-compose.yml : ACTIF, collecte des logs JSON.
+    - /opt/GroupeC/observabilite/grafana/provisioning/datasources/loki.yml : source Loki.
+    - /opt/GroupeC/observabilite/alloy/config.alloy : pipeline Docker -> Loki.
+    - /opt/GroupeC/OpenAppsec/docker-compose.yml : BONUS +2 WAF standalone local.
+    - Sont deployes: Traefik, Nginx temporaire, PostgreSQL, Portainer, Loki, Alloy, Grafana, Moodle, Keycloak.
+    - Routes Moodle/Keycloak: fichiers distincts sous traefik/dynamic; routes.yaml existant conserve.
+    - Pour chaque application qui a une base, joindre GroupeC-applicatif ET GroupeC-donnees.
+    - Redis sur GroupeC-donnees uniquement. Loki/Grafana sur reseau partage sans port public.
+    - Ne pas monter le socket rootless dans les services sans justification.
+    - Le WAF bonus doit rester standalone/local, sans gestion cloud obligatoire.
+    - Dans chaque Compose independant declarer ces reseaux comme external: true.
+    - Pour les secrets: voir /opt/GroupeC/secrets/<app>_db_password sur la VM,
+      NE PAS copier ces fichiers sur GitHub ou dans le code.
+    - Les moteurs applicatifs n acceptent pas tous *_PASSWORD_FILE.
+      Adapter l image avec un point d entree ou mecanisme compatible.
+    - Le contenu des 5 bases est initialise au PREMIER boot du volume PostgreSQL.
+
+    ACCES DE LABORATOIRE (depuis la VM uniquement):
+    - HTTP -> HTTPS: http://demo.localhost:8081/ -> https://demo.localhost:4443/
+    - HTTPS demo: https://demo.localhost:4443/ (certificat local autosigne)
+    - Traefik ping: http://127.0.0.1:8080/ping
+    - Dashboard Traefik: https://dashboard.localhost:4443/dashboard/
+    - Portainer (dans la VM): https://portainer.localhost:4443/
+      Admin Portainer: mot de passe local /opt/GroupeC/secrets/portainer_admin_password
+      Le compte admin est initialise au premier demarrage seulement.
+    - Portainer (depuis Windows, si reseau/DNS/UFW configures):
+      https://portainer.groupec.test:4443/
+    - Grafana (service integre; authentification a verifier):
+      https://grafana.groupec.test:4443/
+      Nom d utilisateur: admin
+      Mot de passe sur la VM: /opt/GroupeC/secrets/grafana_admin_password
+      Ce fichier est protege. Ne jamais publier le secret dans un rapport.
+    - Ping 8080 et HTTP 8081 ecoutes sur 127.0.0.1 seulement.
+    - HTTPS 4443 ecoute sur les interfaces VM; UFW doit limiter l acces aux IP autorisees.
+    - Pour le test Windows: associer portainer.groupec.test et grafana.groupec.test
+      a l IPv4 de la VM dans hosts/DNS, puis autoriser l IP du PC dans UFW.
+    - Exemple temporaire dans Ubuntu: sudo ufw allow from <IP_PC> to any port 4443 proto tcp
+    - Ne pas exposer ce laboratoire sur Internet. Certificat autosigne a approuver localement.
+    - Un collegue distant n a pas acces sans connectivite reseau (VPN/reseau VM).
+
+    TESTS APRES PREMIER BOOT (dans Multipass):
+      sudo cloud-init status --wait
+      docker context show
+      docker info --format '{{json .SecurityOptions}}'
+      docker ps
+      docker network inspect GroupeC-donnees --format '{{.Internal}}'
+      sudo ss -ltpn | grep -E ':(22|8080|8081|4443) '
+      curl --noproxy '*' -fsS http://127.0.0.1:8080/ping
+      curl --noproxy '*' --cacert /opt/GroupeC/traefik/certs/local.crt \
+        --resolve demo.localhost:4443:127.0.0.1 https://demo.localhost:4443/
+      docker compose -f /opt/GroupeC/postgresql/docker-compose.yml ps
+      docker compose -f /opt/GroupeC/portainer/docker-compose.yml ps
+      docker compose -f /opt/GroupeC/observabilite/loki/docker-compose.yml ps
+      docker compose -f /opt/GroupeC/observabilite/alloy/docker-compose.yml ps
+      docker compose -f /opt/GroupeC/observabilite/grafana/docker-compose.yml ps
+      docker network inspect GroupeC-observabilite --format '{{.Internal}}'
+      docker info --format '{{.LoggingDriver}}'
+      docker logs --tail 50 groupec-alloy
+      docker logs --tail 50 groupec-loki
+      curl --noproxy '*' --cacert /opt/GroupeC/traefik/certs/local.crt \
+        --resolve grafana.groupec.test:4443:127.0.0.1 https://grafana.groupec.test:4443/login
+      # Puis se connecter a Grafana et verifier une requete LogQL de collecte reelle.
+      curl --noproxy '*' --cacert /opt/GroupeC/traefik/certs/local.crt \
+        --resolve portainer.localhost:4443:127.0.0.1 https://portainer.localhost:4443/api/system/status
+      docker compose -f /opt/GroupeC/postgresql/docker-compose.yml exec -T postgres \
+        psql -U postgres -d postgres -c \
+        "SELECT datname, pg_get_userbyid(datdba) AS owner FROM pg_database WHERE datname IN ('moodle','keycloak','drupal','n8n','opencast');"
+
+    ATTENTION:
+    - Ne pas executer ce cloud-init sur la VM originale deja en service.
+    - Creer une VM test NEUVE. La creation de volumes/secrets se fait au premier boot.
+    - Les certificats autosignes ne sont pas reconnus par les navigateurs publics.
+    - Le socket Docker Rootless donne un pouvoir important: pas d acces collectif sans politique.
+    - Authentification SSH par cle et pas de mot de passe SSH.
+    - Pour ajouter les services applicatifs, il faut plus de RAM/disque que la base.
+
+    SERVICES AJOUTES : https://moodle.groupec.test:4443/ et https://keycloak.groupec.test:4443/
+    SSO: provisionne automatiquement. VOIR /opt/GroupeC/README-FINAL-CR465.txt
+# ============================================================================
+# RUNCMD : trois etapes BLOQUANTES, controlees, sans lancement des gabarits.
+# ============================================================================
+- path: /opt/GroupeC/moodle/configure-curl-oidc.php
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    <?php
+    // CR465. Laisser accessibles a Moodle uniquement Traefik OIDC sur le
+    // reseau applicatif, sans desactiver le blocage des autres IP privees.
+    define('CLI_SCRIPT', true);
+    require '/var/www/html/config.php';
+
+    $targetip = $argv[1] ?? '';
+    if (!filter_var($targetip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        fwrite(STDERR, "ERREUR: IP du proxy Keycloak invalide.\n");
+        exit(1);
+    }
+    $dns = gethostbynamel('keycloak.groupec.test');
+    if (!$dns || count($dns) !== 1 || $dns[0] !== $targetip) {
+        fwrite(STDERR, "ERREUR: resolution DNS Keycloak differente de l'IP Traefik attendue.\n");
+        exit(1);
+    }
+
+    /** Retire une seule IP d'un CIDR IPv4, en conservant le blocage des autres. */
+    function exclure_ip_cidr(string $cidr, string $ip): array {
+        $pieces = explode('/', $cidr, 2);
+        if (count($pieces) !== 2 || !filter_var($pieces[0], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+            || !ctype_digit($pieces[1]) || (int)$pieces[1] > 32) {
+            return [$cidr];
+        }
+        $prefix = (int)$pieces[1];
+        $shift = 32 - $prefix;
+        $mask = $prefix === 0 ? 0 : ((0xffffffff << $shift) & 0xffffffff);
+        $start = ip2long($pieces[0]) & $mask;
+        $target = ip2long($ip);
+        if (($target & $mask) !== $start) {
+            return [$cidr];
+        }
+        $result = [];
+        $current = $start;
+        for ($newprefix = $prefix + 1; $newprefix <= 32; $newprefix++) {
+            $halfsize = 1 << (32 - $newprefix);
+            if ($target < $current + $halfsize) {
+                $result[] = long2ip($current + $halfsize) . '/' . $newprefix;
+            } else {
+                $result[] = long2ip($current) . '/' . $newprefix;
+                $current += $halfsize;
+            }
+        }
+        return $result;
+    }
+
+    $ports = preg_split('/[\s,;]+/', (string)($CFG->curlsecurityallowedport ?? '80 443'), -1, PREG_SPLIT_NO_EMPTY);
+    $ports = array_values(array_unique(array_merge($ports, ['80', '443', '4443'])));
+    set_config('curlsecurityallowedport', implode("\n", $ports));
+    $CFG->curlsecurityallowedport = implode("\n", $ports);
+
+    $blocked = preg_split('/[\s,;]+/', (string)($CFG->curlsecurityblockedhosts ?? ''), -1, PREG_SPLIT_NO_EMPTY);
+    $filtered = [];
+    foreach ($blocked as $entry) {
+        if ($entry === $targetip || $entry === $targetip . '/32') {
+            continue;
+        }
+        foreach (exclure_ip_cidr($entry, $targetip) as $net) {
+            $filtered[] = $net;
+        }
+    }
+    $filtered = array_values(array_unique($filtered));
+    set_config('curlsecurityblockedhosts', implode("\n", $filtered));
+    $CFG->curlsecurityblockedhosts = implode("\n", $filtered);
+
+    $helper = new \core\files\curl_security_helper();
+    $url = 'https://keycloak.groupec.test:4443/realms/groupec/.well-known/openid-configuration';
+    if ($helper->url_is_blocked($url)) {
+        fwrite(STDERR, "ERREUR: OIDC encore bloque par curl_security_helper.\n");
+        exit(1);
+    }
+    echo "SUCCES: cURL Moodle autorise exclusivement l'IP Traefik pour le SSO sur port 4443.\n";
+- path: /opt/GroupeC/keycloak/provision-users.py
+  owner: root:root
+  permissions: !!str "0755"
+  content: |
+    #!/usr/bin/env python3
+    """CR465: provisionnement idempotent des comptes Keycloak, sur la VM.
+    Aucun secret n'est imprime, stocke dans le YAML ou passe en argument CLI.
+    """
+    import json
+    import os
+    import ssl
+    import sys
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    from pathlib import Path
+
+    ROOT = Path('/opt/GroupeC')
+    SECRETS = ROOT / 'secrets'
+    # Nom DNS officiel pour un SNI TLS correct; resolution locale via /etc/hosts.
+    BASE = 'https://keycloak.groupec.test:4443'
+    CTX = ssl.create_default_context(cafile=str(ROOT / 'traefik/certs/local.crt'))
+    OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=CTX))
+
+
+    def secret(name):
+        return (SECRETS / name).read_text(encoding='utf-8').strip()
+
+
+    def request(method, path, token=None, payload=None, form=False):
+        headers = {'Host': 'keycloak.groupec.test', 'Accept': 'application/json'}
+        data = None
+        if payload is not None:
+            if form:
+                data = urllib.parse.urlencode(payload).encode('utf-8')
+                headers['Content-Type'] = 'application/x-www-form-urlencoded'
+            else:
+                data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+                headers['Content-Type'] = 'application/json'
+        if token:
+            headers['Authorization'] = 'Bearer ' + token
+        url = BASE + path
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with OPENER.open(req, timeout=20) as resp:
+                body = resp.read()
+                return resp.status, (json.loads(body) if body else None)
+        except urllib.error.HTTPError as exc:
+            # Ne pas afficher un corps d'erreur potentiellement sensible.
+            raise RuntimeError(f'Keycloak HTTP {exc.code} sur {method} {path.split("?")[0]}') from None
+
+
+    def login(username, password):
+        status, result = request('POST', '/realms/master/protocol/openid-connect/token', payload={
+            'grant_type': 'password', 'client_id': 'admin-cli',
+            'username': username, 'password': password,
+        }, form=True)
+        if status != 200 or not result or not result.get('access_token'):
+            raise RuntimeError('Authentification administrative impossible')
+        return result['access_token']
+
+
+    def get_user(token, realm, username):
+        q = urllib.parse.urlencode({'username': username, 'exact': 'true'})
+        _, users = request('GET', f'/admin/realms/{realm}/users?{q}', token=token)
+        matching = [x for x in users if x.get('username') == username]
+        if len(matching) > 1:
+            raise RuntimeError('Utilisateurs Keycloak en doublon')
+        return matching[0] if matching else None
+
+
+    def create_user(token, realm, username, attrs):
+        req_path = f'/admin/realms/{realm}/users'
+        status, _ = request('POST', req_path, token=token, payload={'username': username, 'enabled': True, **attrs})
+        if status not in (200, 201, 204):
+            raise RuntimeError(f'Creation du compte {realm}/{username}: HTTP {status}')
+        user = get_user(token, realm, username)
+        if not user:
+            raise RuntimeError(f'Creation non verifiable : {realm}/{username}')
+        return user
+
+
+    def set_password(token, realm, user_id, password):
+        status, _ = request('PUT', f'/admin/realms/{realm}/users/{user_id}/reset-password', token=token,
+                            payload={'type': 'password', 'value': password, 'temporary': False})
+        if status != 204:
+            raise RuntimeError('Le mot de passe Keycloak n a pas ete enregistre')
+
+
+    def main():
+        admin_password = secret('keycloak_permanent_admin_password')
+        bootstrap_password = secret('keycloak_admin_password')
+        test_password = secret('etudiant_test_password')
+        # Preferer les droits durables si le compte temporaire a deja ete supprime.
+        try:
+            token = login('groupec-admin', admin_password)
+            # Un compte partiellement cree peut avoir un mot de passe mais pas
+            # encore le role admin: retenter alors avec le bootstrap.
+            status, _ = request('GET', '/admin/realms/master', token=token)
+            if status != 200:
+                raise RuntimeError('Droits du compte permanent incomplets')
+            using_bootstrap = False
+        except RuntimeError:
+            token = login('admin', bootstrap_password)
+            using_bootstrap = True
+
+        existing = get_user(token, 'master', 'groupec-admin')
+        if not existing:
+            if not using_bootstrap:
+                raise RuntimeError('Admin permanent absent alors que bootstrap non accessible')
+            existing = create_user(token, 'master', 'groupec-admin', {
+                'firstName': 'Groupe', 'lastName': 'C Administrateur',
+                'email': 'groupec-admin@groupec.test', 'emailVerified': True,
+            })
+            set_password(token, 'master', existing['id'], admin_password)
+            print('Compte administrateur permanent cree.')
+        elif using_bootstrap:
+            # Si la creation du compte avait ete interrompue, restaurer le mot de passe attendu.
+            set_password(token, 'master', existing['id'], admin_password)
+
+        _, admin_role = request('GET', '/admin/realms/master/roles/admin', token=token)
+        if not admin_role or not admin_role.get('id'):
+            raise RuntimeError('Role admin du realm master introuvable')
+        _, assigned = request('GET', f'/admin/realms/master/users/{existing["id"]}/role-mappings/realm', token=token)
+        if not any(role.get('name') == 'admin' for role in assigned):
+            status, _ = request('POST', f'/admin/realms/master/users/{existing["id"]}/role-mappings/realm',
+                                token=token, payload=[admin_role])
+            if status != 204:
+                raise RuntimeError('Attribution role administrateur en echec')
+
+        # Controle de droits EFFECTIF avant suppression du bootstrap.
+        permanent_token = login('groupec-admin', admin_password)
+        for realm in ('master', 'groupec'):
+            status, _ = request('GET', f'/admin/realms/{realm}', token=permanent_token)
+            if status != 200:
+                raise RuntimeError(f'Droits administrateur permanents insuffisants sur {realm}')
+        print('Administrateur permanent teste et autorise sur master + groupec.')
+
+        test_user = get_user(permanent_token, 'groupec', 'etudiant-test')
+        if not test_user:
+            test_user = create_user(permanent_token, 'groupec', 'etudiant-test', {
+                'firstName': 'Etudiant', 'lastName': 'Test',
+                'email': 'etudiant-test@groupec.test', 'emailVerified': True,
+            })
+            set_password(permanent_token, 'groupec', test_user['id'], test_password)
+            print('Compte de demonstration etudiant-test cree avec secret local.')
+        else:
+            print('Compte etudiant-test deja present; mot de passe conserve.')
+
+        # Ne supprimer le bootstrap qu apres controle de connexion et des autorisations.
+        bootstrap = get_user(permanent_token, 'master', 'admin')
+        if bootstrap:
+            if bootstrap['id'] == existing['id']:
+                raise RuntimeError('Refus de supprimer le seul administrateur')
+            status, _ = request('DELETE', f'/admin/realms/master/users/{bootstrap["id"]}', token=permanent_token)
+            if status != 204:
+                raise RuntimeError('Suppression du compte bootstrap en echec')
+            if get_user(permanent_token, 'master', 'admin'):
+                raise RuntimeError('Le compte bootstrap admin reste present')
+            print('Compte bootstrap admin supprime apres verification du remplacement.')
+        else:
+            print('Compte bootstrap deja absent.')
+        print('SUCCES Keycloak: admin permanent + utilisateur de test; secrets dans /opt/GroupeC/secrets.')
+
+
+    if __name__ == '__main__':
+        try:
+            main()
+        except (RuntimeError, ValueError, OSError, urllib.error.URLError) as err:
+            print('ERREUR provisionnement Keycloak: ' + str(err), file=sys.stderr)
+            sys.exit(1)
+- path: /opt/GroupeC/README-FINAL-CR465.txt
+  owner: root:root
+  permissions: !!str "0644"
+  content: |
+    CR465 GROUPE C — GUIDE DU YAML FINAL (VM NEUVE UNIQUEMENT)
+    ============================================================
+    Version : plateforme de base + Moodle/Keycloak SSO, admin permanent, test etudiant.
+
+    AUTOMATISE AU PREMIER BOOT
+    - Docker Engine Rootless (compte ubuntu), Compose, SSH par cle, UFW 22/4443.
+    - Quatre reseaux : exposition, applicatif (172.28.240.0/24), donnees (internal),
+      observabilite (internal). Traefik IP applicative fixe 172.28.240.10.
+    - Traefik HTTPS autosigne 4443, dashboard BasicAuth, Nginx demo.
+    - PostgreSQL 17 + cinq bases/roles distincts : moodle, keycloak, drupal, n8n, opencast.
+    - Portainer CE + Grafana + Loki + Alloy (persistants, logs Rootless).
+    - Moodle + Keycloak : realms, client confidentiel, secret OIDC aleatoire.
+    - Moodle : email+oauth2, issuer Keycloak, 3 endpoints, 3 mappings utilisateur,
+      protection SSRF maintenue avec exception d'une IP interne precise, 4443 cURL.
+    - Keycloak master : admin permanent groupec-admin cree et ses droits testes.
+      Bootstrap admin SUPPRIME uniquement apres la verification des droits du nouveau.
+    - Compte etudiant-test dans le realm groupec, password aleatoire local.
+
+    SECRETS (ne pas copier vers GitHub, video ou conversation)
+    /opt/GroupeC/secrets/keycloak_permanent_admin_password
+    /opt/GroupeC/secrets/etudiant_test_password
+    /opt/GroupeC/secrets/moodle_admin_password
+    /opt/GroupeC/secrets/moodle_oidc_client_secret
+    /opt/GroupeC/secrets/grafana_admin_password
+    /opt/GroupeC/secrets/portainer_admin_password
+    Aucun mot de passe utilisateur n'est code en dur dans le YAML.
+    L'administrateur Keycloak est desormais groupec-admin (master).
+
+    CONNEXION DEPUIS WINDOWS / VIRTUALBOX NAT
+    La redirection NAT et le fichier hosts du PC WINDOWS ne peuvent pas etre
+    modifies par un cloud-init lance DANS la VM. Utiliser le script compagnon
+    GroupeC-Windows-Acces.ps1 (PowerShell administrateur; VBoxManage + PsExec).
+    Lier 127.0.0.1:4443 -> VM NAT:4443 et associer les noms *.groupec.test du labo
+    (ou .localhost pour portainer) a 127.0.0.1 sur Windows.
+    Le certificat HTTPS est autosigne et propre au LABORATOIRE, PAS de confiance
+    publique. Ne jamais exposer la redirection NAT sur 0.0.0.0 dans Windows.
+
+    URL DE TEST
+    https://moodle.groupec.test:4443/
+    https://keycloak.groupec.test:4443/admin/master/console/
+    https://grafana.groupec.test:4443/
+    https://portainer.localhost:4443/
+    https://demo.localhost:4443/
+    https://dashboard.localhost:4443/dashboard/
+
+    PREUVES A CAPTURER POUR CR465
+    sudo cloud-init status --wait --long
+    sudo tail -n 80 /var/log/cloud-init-output.log
+    docker context show; docker info | grep -A6 'Security Options'
+    docker ps --format 'table {{.Names}}\t{{.Status}}'
+    loginctl show-user ubuntu -p Linger
+    sudo ufw status verbose
+    docker network inspect GroupeC-donnees --format '{{.Internal}}'
+    docker network inspect GroupeC-observabilite --format '{{.Internal}}'
+    La preuve SSO doit inclure navigateur Windows : connexion etudiant-test sur
+    Keycloak, retour au tableau de bord Moodle et nom de l'utilisateur.
+    Verifier une requete Loki depuis Grafana et une ligne de log reelle d'un conteneur.
+
+    PROCHAINS SERVICES A INTEGRER
+    Drupal Commerce + n8n: gabarits COMMENTES, non deployes. Leurs bases et
+    secrets existent. Fournir de vrais Compose aux chemins /opt/GroupeC/drupal/
+    et /opt/GroupeC/n8n/. Ne pas publier leurs ports sur l'hote : ajouter leurs
+    routes HTTPS Traefik avec hostnames differents. Pour n8n, proteger la console,
+    utiliser N8N_ENCRYPTION_KEY persistante, proteger webhooks/API et credentials.
+    Pour Drupal, initialiser l'application et Commerce en paiement fictif; ne pas
+    reutiliser le meme schema SQL ni les secrets de Moodle/Keycloak. Synchroniser
+    les utilisateurs/inscriptions via des API securisees, pas par SQL direct.
+    OPencast/Redis/OpenAppSec: encore a l'etat de gabarits / bonus.
+
+    SECURITE / CONTROLE DU PERIMETRE
+    Ne pas exposer PostgreSQL (5432), Redis (6379), Loki (3100), Keycloak HTTP 8080,
+    Moodle HTTP 8080, Grafana HTTP 3000 et Portainer HTTP 9000.
+    UFW ouvre 4443 pour le laboratoire mais l'acces depuis WINDOWS est confine a
+    127.0.0.1 par VirtualBox NAT. Revoir UFW si migration vers un reseau bridge.
+    Une machine neuve peut echouer si le sous-reseau 172.28.240.0/24 chevauche un
+    VPN ou un reseau existant : choisir alors un CIDR libre + mise a jour compose,
+    verification et regle SSL avant redeploiement.
+
+    ATTENTION : NE PAS lancer ce cloud-init sur la VM EXISTANTE.
+    Une nouvelle VM vide est necessaire pour valider le 100% automatisation.
+    La presence de 9 services dans docker ps ne prouve pas la connexion navigateur.
+runcmd:
+  # 1) Preparation SSH / Docker Engine / pare-feu / desactivation docker rootful.
+- [bash, /usr/local/sbin/prepare-docker-rootless.sh]
+  # 2) Docker Rootless comme service systemd --user avec linger et controle.
+- [bash, /usr/local/sbin/activate-docker-rootless.sh]
+  # 3) Secrets, certificats, 4 reseaux, base et observabilite Loki/Alloy/Grafana.
+- [bash, /opt/GroupeC/deploy.sh]
+
+final_message: 'CR465 GroupeC : deploiement automatise fini ; controler 9 conteneurs, SSO, utilisateurs Keycloak, Grafana/Loki et acces navigateur.'
