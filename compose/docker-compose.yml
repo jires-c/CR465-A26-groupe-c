@@ -1,0 +1,30 @@
+# =============================================================================
+# CR465 - GroupeC : agrégateur Docker Compose
+# -----------------------------------------------------------------------------
+# Ce fichier regroupe tous les projets via `include:`. Il NE remplace PAS
+# cloud-init : les réseaux externes (GroupeC-exposition / -applicatif /
+# -donnees / -observabilite), les secrets sous /opt/GroupeC/secrets et les
+# fichiers .env de chaque service sont créés par cloud-init/scripts/deploy.sh.
+# Lancer deploy.sh (ou son équivalent) AVANT tout `docker compose up`.
+#
+# Ordre de démarrage recommandé : postgresql -> traefik -> observability
+# -> keycloak -> moodle -> n8n -> drupal-commerce -> portainer.
+# =============================================================================
+name: groupec
+
+include:
+  - path: postgresql/docker-compose.yml
+  - path: traefik/docker-compose.yml
+  - path: observability/loki/docker-compose.yml
+  - path: observability/alloy/docker-compose.yml
+  - path: observability/grafana/docker-compose.yml
+  - path: keycloak/docker-compose.yml
+  - path: moodle/docker-compose.yml
+  - path: n8n/docker-compose.yml
+  - path: drupal-commerce/docker-compose.yml
+  - path: portainer/docker-compose.yml
+  - path: webtest/docker-compose.yml
+  # Optionnels / bonus (laissés hors include par défaut) :
+  # - path: opencast/docker-compose.yml
+  # - path: redis/docker-compose.yml
+  # - path: openappsec/docker-compose.yml

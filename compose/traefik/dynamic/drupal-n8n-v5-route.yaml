@@ -1,0 +1,43 @@
+# Routes V5: aucun port direct sur l'hote pour Drupal ou n8n.
+http:
+  routers:
+    drupal-v5:
+      rule: "Host(`drupal.groupec.test`)"
+      entryPoints:
+        - websecure
+      service: drupal-v5-service
+      tls: {}
+    n8n-v5:
+      rule: "Host(`n8n.groupec.test`)"
+      entryPoints:
+        - websecure
+      service: n8n-v5-service
+      middlewares:
+        - n8n-v5-headers
+      tls: {}
+    # Reprise du port interne 4443 : la route Moodle doit etre joignable
+    # par n8n en TLS sur le sous-reseau Docker, sans reconfiguration du SSO.
+    moodle-v5-internal:
+      rule: "Host(`moodle.groupec.test`)"
+      entryPoints:
+        - sso-internal
+      service: moodle-v5-internal-service
+      tls: {}
+  middlewares:
+    n8n-v5-headers:
+      headers:
+        contentTypeNosniff: true
+        referrerPolicy: strict-origin-when-cross-origin
+  services:
+    drupal-v5-service:
+      loadBalancer:
+        servers:
+          - url: "http://drupal:80"
+    n8n-v5-service:
+      loadBalancer:
+        servers:
+          - url: "http://n8n:5678"
+    moodle-v5-internal-service:
+      loadBalancer:
+        servers:
+          - url: "http://moodle:8080"

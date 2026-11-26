@@ -1,0 +1,16 @@
+# Keycloak OIDC : 443 (public via 4443 hote), et 4443 interne pour Moodle.
+# Aucun port HTTP direct vers l hote.
+http:
+  routers:
+    keycloak:
+      rule: Host(`keycloak.groupec.test`) || Host(`keycloak.localhost`)
+      entryPoints:
+      - websecure
+      - sso-internal
+      service: keycloak-service
+      tls: {}
+  services:
+    keycloak-service:
+      loadBalancer:
+        servers:
+        - url: http://keycloak:8080

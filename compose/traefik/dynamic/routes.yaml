@@ -1,0 +1,55 @@
+# TRAEFIK - routage HTTPS local. Aucun socket Docker n est monte.
+# Portainer et Grafana actifs; routage HTTPS depuis Traefik.
+# Drupal/n8n utilisent drupal-n8n-v5-route.yaml ; Moodle/Keycloak ont leurs routes dediees.
+http:
+  routers:
+    demo:
+      rule: "Host(`demo.localhost`)"
+      entryPoints:
+        - websecure
+      service: demo-service
+      tls: {}
+    dashboard:
+      rule: "Host(`dashboard.localhost`)"
+      entryPoints:
+        - websecure
+      service: api@internal
+      middlewares:
+        - dashboard-auth
+      tls: {}
+    portainer:
+      rule: "Host(`portainer.localhost`) || Host(`portainer.groupec.test`)"
+      entryPoints:
+        - websecure
+      service: portainer-service
+      tls: {}
+    # La route Grafana utilise le service DNS "grafana" sur GroupeC-applicatif.
+    grafana:
+      rule: "Host(`grafana.groupec.test`)"
+      entryPoints:
+        - websecure
+      service: grafana-service
+      tls: {}
+    # Moodle/Keycloak : routes ACTIVES dans dynamic/moodle-route.yaml et dynamic/keycloak-route.yaml.
+    # Drupal Commerce et n8n exposes uniquement par Traefik (port de labo 4443).
+    # Acces n8n protege par ses comptes internes, aucun port direct publie.
+    # TODO OPENCAST: si actif, route HTTPS vers le service video interne.
+    # REDIS/LOKI: aucun routage public.
+    # OPENAPPSEC: mode standalone local, integrer selon la doc WAF/Traefik.
+  middlewares:
+    dashboard-auth:
+      basicAuth:
+        usersFile: /auth/users.htpasswd
+  services:
+    demo-service:
+      loadBalancer:
+        servers:
+          - url: "http://webtest:80"
+    portainer-service:
+      loadBalancer:
+        servers:
+          - url: "http://portainer:9000"
+    grafana-service:
+      loadBalancer:
+        servers:
+          - url: "http://grafana:3000"

@@ -1,0 +1,97 @@
+# EXPLICATION : Projet Compose separe, dedie a la couche de donnees PostgreSQL.
+name: groupec-postgresql
+# EXPLICATION : Liste des conteneurs de ce fichier : ici un seul serveur PostgreSQL.
+services:
+  # EXPLICATION : Nom du service : les applications sur le reseau donnees utiliseront "postgres" comme hote.
+  postgres:
+    # EXPLICATION : Image PostgreSQL version 17 ; les mises a jour mineures peuvent changer avec ce tag.
+    image: postgres:17
+    # EXPLICATION : Relance PostgreSQL au redemarrage, sauf si on l a arrete volontairement.
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # EXPLICATION : Variables lues par le script de demarrage de l image officielle PostgreSQL.
+    environment:
+      # EXPLICATION : Cree le superutilisateur PostgreSQL initial nomme postgres.
+      POSTGRES_USER: postgres
+      # EXPLICATION : Cree/selectionne la base initiale postgres.
+      POSTGRES_DB: postgres
+      # EXPLICATION : Lit le mot de passe administrateur depuis un fichier secret, pas depuis une valeur dans le YAML.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
+      # EXPLICATION : Demande SCRAM-SHA-256 pour les connexions TCP initiales de PostgreSQL.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    # Aucun port publie : connexion seulement via le reseau Docker donnees.
+    # EXPLICATION : Persiste les donnees et monte le script d initialisation dans le conteneur.
+    volumes:
+      # EXPLICATION : Volume Docker nomme : les donnees restent apres recreation du conteneur (sans "down -v").
+      - postgres_data:/var/lib/postgresql/data
+      # EXPLICATION : Script execute automatiquement par l image officielle si le volume de donnees est vide.
+      - /opt/GroupeC/postgresql/initdb/01-init-databases.sh:/docker-entrypoint-initdb.d/01-init-databases.sh:ro
+    # EXPLICATION : Liste des secrets accessibles a CE conteneur PostgreSQL.
+    secrets:
+      # EXPLICATION : Mot de passe administrateur, lu au demarrage par POSTGRES_PASSWORD_FILE.
+      - postgres_admin_password
+      # EXPLICATION : Mot de passe du role Moodle, utilise par le script initdb.
+      - moodle_db_password
+      # EXPLICATION : Mot de passe du role Keycloak, utilise par le script initdb.
+      - keycloak_db_password
+      # EXPLICATION : Mot de passe du role Drupal, utilise par le script initdb.
+      - drupal_db_password
+      # EXPLICATION : Mot de passe du role n8n, utilise par le script initdb.
+      - n8n_db_password
+      # EXPLICATION : Mot de passe de la base Opencast (service optionnel).
+      - opencast_db_password
+    # EXPLICATION : PostgreSQL rejoint UNIQUEMENT le reseau de donnees.
+    networks:
+      # EXPLICATION : Pas de liaison reseau directe avec Traefik ; seules les applications autorisees rejoindront donnees.
+      - donnees
+    # EXPLICATION : Verification recurrente pour savoir si PostgreSQL accepte des connexions.
+    healthcheck:
+      # EXPLICATION : pg_isready teste si PostgreSQL est pret ; ne verifie pas toutes les applications ni leurs schemas.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      # EXPLICATION : Lance le healthcheck toutes les 5 secondes.
+      interval: 5s
+      # EXPLICATION : Un essai expire apres 3 secondes.
+      timeout: 3s
+      # EXPLICATION : Apres 30 echecs consecutifs, Docker peut declarer le conteneur unhealthy.
+      retries: 30
+      # EXPLICATION : Accorde un delai initial de 20 secondes avant de compter les echecs.
+      start_period: 20s
+
+# EXPLICATION : Persiste les donnees et monte le script d initialisation dans le conteneur.
+volumes:
+  # EXPLICATION : Declare le volume nomme que Docker gere pour conserver les fichiers de la base.
+  postgres_data:
+
+# EXPLICATION : Liste des secrets accessibles a CE conteneur PostgreSQL.
+secrets:
+  # Les valeurs sont generees a la creation de la VM, jamais dans ce YAML.
+  # EXPLICATION : Reference le fichier de secret administrateur genere sur la VM.
+  postgres_admin_password:
+    file: /opt/GroupeC/secrets/postgres_admin_password
+  # EXPLICATION : Reference le fichier du secret Moodle.
+  moodle_db_password:
+    file: /opt/GroupeC/secrets/moodle_db_password
+  # EXPLICATION : Reference le fichier du secret Keycloak.
+  keycloak_db_password:
+    file: /opt/GroupeC/secrets/keycloak_db_password
+  # EXPLICATION : Reference le fichier du secret Drupal.
+  drupal_db_password:
+    file: /opt/GroupeC/secrets/drupal_db_password
+  # EXPLICATION : Reference le fichier du secret n8n.
+  n8n_db_password:
+    file: /opt/GroupeC/secrets/n8n_db_password
+  # Mot de passe SQL Opencast, genere meme si le service est desactive.
+  opencast_db_password:
+    file: /opt/GroupeC/secrets/opencast_db_password
+
+# EXPLICATION : PostgreSQL rejoint UNIQUEMENT le reseau de donnees.
+networks:
+  donnees:
+    # EXPLICATION : Compose ne cree pas ce reseau : il reutilise GroupeC-donnees deja cree par deploy.sh.
+    external: true
+    # EXPLICATION : Nom commun de la zone de donnees, avec option Docker --internal.
+    name: GroupeC-donnees

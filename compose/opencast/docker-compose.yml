@@ -1,0 +1,26 @@
+# OPENCAST - OPTIONNEL mais fortement souhaite dans l enonce.
+# EMPLACEMENT RESERVE : ce fichier est une aide d integration, pas un Compose actif.
+# Mission: heberger du contenu video et permettre un lien/usage depuis Moodle.
+# Base SQL preparee AUTOMATIQUEMENT par la presente base cloud-init:
+#   hote: postgres ; port: 5432 ; base: opencast ; utilisateur: opencast.
+#   secret: /opt/GroupeC/secrets/opencast_db_password.
+# La configuration JDBC PostgreSQL d Opencast depend de la version retenue:
+#   jdbc:postgresql://postgres:5432/opencast
+# Verifier les besoins reels (image officielle, indexation, fichiers video,
+# eventuels stockages/ports et mecanisme de liaison Moodle).
+# Stockage persistant a planifier: bibliotheque media, donnees applicatives.
+# Traefik: ajouter une route HTTPS apres installation, exemple:
+#   Host(`opencast.localhost`) -> http://opencast:<port-app>.
+# Reseaux: GroupeC-applicatif + GroupeC-donnees (pour PostgreSQL).
+# AUCUN port du service expose directement sur l hote.
+# Exemple de declarations reseaux Compose apres ecriture du vrai service:
+# networks:
+#   applicatif:
+#     external: true
+#     name: GroupeC-applicatif
+#   donnees:
+#     external: true
+#     name: GroupeC-donnees
+# Tests a faire: service healthy, donnees persistantes, connexion BDD,
+# routage HTTPS, acces video dans Moodle.
+# NE PAS ACTIVER ce service sans ressources VM supplementaires.

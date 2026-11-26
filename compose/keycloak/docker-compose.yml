@@ -1,0 +1,44 @@
+# Keycloak : image/version du collegue ; PostgreSQL et secrets communs GroupeC.
+# Aucun port hote public. Variables privees lues depuis un fichier local genere.
+name: groupec-keycloak
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.2
+    restart: unless-stopped
+    command:
+    - start
+    - --import-realm
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_HTTP_ENABLED: 'true'
+      KC_HOSTNAME: https://keycloak.groupec.test:4443
+      KC_PROXY_HEADERS: xforwarded
+    networks:
+    - applicatif
+    - donnees
+    volumes:
+    - /opt/GroupeC/keycloak/groupec-realm.json:/opt/keycloak/data/import/groupec-realm.json:ro
+    env_file:
+    - /opt/GroupeC/keycloak/.env
+    security_opt:
+    - no-new-privileges:true
+    cap_drop:
+    - ALL
+    mem_limit: 1100m
+    cpus: '1.5'
+    pids_limit: 512
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+networks:
+  applicatif:
+    external: true
+    name: GroupeC-applicatif
+  donnees:
+    external: true
+    name: GroupeC-donnees

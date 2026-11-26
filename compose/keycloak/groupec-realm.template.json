@@ -1,0 +1,43 @@
+{
+  "realm": "groupec",
+  "enabled": true,
+  "displayName": "Groupe C - Plateforme pédagogique",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "resetPasswordAllowed": true,
+  "clients": [
+    {
+      "clientId": "moodle",
+      "name": "Moodle LMS",
+      "description": "SSO Moodle - Groupe C",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "rootUrl": "https://moodle.groupec.test:4443",
+      "baseUrl": "https://moodle.groupec.test:4443",
+      "redirectUris": [
+        "https://moodle.groupec.test:4443/admin/oauth2callback.php"
+      ],
+      "webOrigins": [
+        "https://moodle.groupec.test:4443"
+      ],
+      "defaultClientScopes": [
+        "web-origins",
+        "acr",
+        "profile",
+        "roles",
+        "email"
+      ],
+      "optionalClientScopes": [
+        "address",
+        "phone",
+        "offline_access"
+      ]
+    }
+  ]
+}

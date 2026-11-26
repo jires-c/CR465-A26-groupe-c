@@ -1,0 +1,7 @@
+name: 'GroupeC n8n'
+type: module
+description: 'Envoie les commandes Commerce à un webhook n8n (commande passée / payée).'
+package: GroupeC
+core_version_requirement: ^10 || ^11
+dependencies:
+  - commerce:commerce_order

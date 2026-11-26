@@ -1,0 +1,18 @@
+# OPENAPPSEC - WAF BONUS +2 POINTS, mode LOCAL / STANDALONE exclusivement.
+# EMPLACEMENT RESERVE : PAS une installation fonctionnelle du WAF.
+# Doit proteger l entree HTTP(S) en lien avec Traefik, sans dependre du
+# tableau de bord SaaS Check Point Infinity.
+# Le vrai montage exige le Compose/agent correspondant a la version
+# de Traefik et au profil standalone de l editeur.
+# Prevoir fichier de politique locale, par exemple:
+#   /opt/GroupeC/OpenAppsec/local_policy.yaml
+# et montage de politique dans l agent (emplacement adapte a l image).
+# IMPORTANT: le Traefik initial utilise le fournisseur de fichiers
+# (aucun Docker socket). Etudier la methode officielle d integration WAF
+# avant de modifier ce choix de securite.
+# Aucun jeton SaaS, aucun mot de passe fixe dans GitHub.
+# Reseau: GroupeC-exposition en frontal / point d entree selon montage;
+# ne PAS connecter WAF directement a PostgreSQL (GroupeC-donnees).
+# Tests requis pour le bonus: trafic normal OK, requete malveillante
+# de laboratoire detectee ou bloquee, journaux et regles locales visibles.
+# En cas de difficulte, laisser DESACTIVE : ce composant n est PAS requis.

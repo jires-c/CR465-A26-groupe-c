@@ -1,0 +1,34 @@
+# Service TEMPORAIRE pour prouver le routage de Traefik.
+# Supprimable lorsque les vraies applications sont disponibles.
+# EXPLICATION : Projet de demonstration Nginx, distinct du projet Traefik.
+name: groupec-webtest
+# EXPLICATION : Contient le service HTTP temporaire utilise pour valider le reverse proxy.
+services:
+  # EXPLICATION : Nom DNS Docker webtest, utilise dans l URL definie par Traefik.
+  webtest:
+    # EXPLICATION : Image Nginx legere basee sur Alpine Linux (version 1.28).
+    image: nginx:1.28-alpine
+    # EXPLICATION : Redemarre automatiquement Nginx avec Docker tant qu il n est pas arrete volontairement.
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # EXPLICATION : Applique des protections supplementaires au processus du conteneur.
+    security_opt:
+      # EXPLICATION : Empeche le gain de nouveaux privileges pour les processus Nginx.
+      - no-new-privileges:true
+    # Aucun "ports": uniquement accessible via le reseau applicatif.
+    # EXPLICATION : Le service Nginx n est attache qu au reseau applicatif, pas aux donnees.
+    networks:
+      # EXPLICATION : Traefik et Nginx partagent ce reseau pour pouvoir communiquer.
+      - applicatif
+
+# EXPLICATION : Le service Nginx n est attache qu au reseau applicatif, pas aux donnees.
+networks:
+  applicatif:
+    # EXPLICATION : Compose reutilise un reseau cree ailleurs au lieu de creer son propre reseau prive.
+    external: true
+    # EXPLICATION : Nom exact du reseau cree par le script de deploiement.
+    name: GroupeC-applicatif

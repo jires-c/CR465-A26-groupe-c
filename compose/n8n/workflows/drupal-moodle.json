@@ -1,0 +1,545 @@
+{
+  "id": "GroupeCMoodle001",
+  "name": "Groupe C V5 - commande payee Drupal vers inscription Moodle",
+  "active": false,
+  "nodes": [
+    {
+      "id": "v5-wh",
+      "name": "Webhook Drupal",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "commande-payee",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "c052d7be-17bb-5dd1-8256-e6cef99c95ee"
+    },
+    {
+      "id": "v5-auth",
+      "name": "Commande payee et token valide ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        230,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "condition-1",
+              "leftValue": "={{ $json.headers['x-groupec-token'] || '' }}",
+              "rightValue": "={{ $env.N8N_WEBHOOK_TOKEN }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "condition-1",
+              "leftValue": "={{ $json.body.evenement }}",
+              "rightValue": "commande_payee",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "v5-deny",
+      "name": "Refus 403",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        490,
+        260
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"ok\":false,\"erreur\":\"Acces refuse ou evenement non paye\"}",
+        "options": {
+          "responseCode": 403
+        }
+      }
+    },
+    {
+      "id": "v5-normal",
+      "name": "Une formation de demonstration",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        490,
+        -100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const body = $input.first().json.body || {};\nconst a = (body.articles || []).find(x => x.sku);\nif (!body.email || !a) throw new Error('Commande sans email ou formation SKU');\nreturn [{json:{commande_id: body.commande_id, email: String(body.email).trim(), sku: String(a.sku).trim(), titre: a.titre}}];"
+      }
+    },
+    {
+      "id": "v5-5",
+      "name": "Moodle : chercher utilisateur",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        740,
+        -100
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://moodle.groupec.test:4443/webservice/rest/server.php",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "wstoken",
+              "value": "={{ $env.MOODLE_TOKEN }}"
+            },
+            {
+              "name": "wsfunction",
+              "value": "core_user_get_users_by_field"
+            },
+            {
+              "name": "moodlewsrestformat",
+              "value": "json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "field",
+              "value": "email"
+            },
+            {
+              "name": "values[0]",
+              "value": "={{ $('Une formation de demonstration').first().json.email }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "v5-user",
+      "name": "Etudiant deja connecte a Moodle ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        980,
+        -100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "condition-5",
+              "leftValue": "={{ String($json.id ?? '') }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "v5-missinguser",
+      "name": "Etudiant absent 422",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1220,
+        150
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"ok\":false,\"erreur\":\"Etudiant absent: se connecter d abord a Moodle via Keycloak avec le meme email\"}",
+        "options": {
+          "responseCode": 422
+        }
+      }
+    },
+    {
+      "id": "v5-8",
+      "name": "Moodle : chercher cours",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1220,
+        -200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://moodle.groupec.test:4443/webservice/rest/server.php",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "wstoken",
+              "value": "={{ $env.MOODLE_TOKEN }}"
+            },
+            {
+              "name": "wsfunction",
+              "value": "core_course_get_courses_by_field"
+            },
+            {
+              "name": "moodlewsrestformat",
+              "value": "json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "field",
+              "value": "shortname"
+            },
+            {
+              "name": "value",
+              "value": "={{ $('Une formation de demonstration').first().json.sku }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "v5-course",
+      "name": "Cours correspondant existe ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1460,
+        -200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "condition-8",
+              "leftValue": "={{ String($json.courses?.[0]?.id ?? '') }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "v5-missingcourse",
+      "name": "Cours absent 422",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1700,
+        70
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"ok\":false,\"erreur\":\"Cours correspondant au SKU inexistant dans Moodle\"}",
+        "options": {
+          "responseCode": 422
+        }
+      }
+    },
+    {
+      "id": "v5-11",
+      "name": "Moodle : inscrire etudiant",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1700,
+        -290
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://moodle.groupec.test:4443/webservice/rest/server.php",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "wstoken",
+              "value": "={{ $env.MOODLE_TOKEN }}"
+            },
+            {
+              "name": "wsfunction",
+              "value": "enrol_manual_enrol_users"
+            },
+            {
+              "name": "moodlewsrestformat",
+              "value": "json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "enrolments[0][roleid]",
+              "value": "={{ $env.MOODLE_STUDENT_ROLE_ID }}"
+            },
+            {
+              "name": "enrolments[0][userid]",
+              "value": "={{ $('Moodle : chercher utilisateur').first().json.id || $('Moodle : chercher utilisateur').first().json[0].id }}"
+            },
+            {
+              "name": "enrolments[0][courseid]",
+              "value": "={{ $json.courses[0].id }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "v5-check-enrol",
+      "name": "API inscription sans erreur ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1940,
+        -290
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "condition-11",
+              "leftValue": "={{ $json.exception || $json.errorcode || \"\" }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "v5-error-enrol",
+      "name": "Erreur inscription 502",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2170,
+        -70
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"ok\":false,\"erreur\":\"API Moodle a retourne une erreur\"}",
+        "options": {
+          "responseCode": 502
+        }
+      }
+    },
+    {
+      "id": "v5-ok",
+      "name": "Inscription confirmee",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2170,
+        -390
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"ok\":true,\"message\":\"Demande d inscription transmise a Moodle\"}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook Drupal": {
+      "main": [
+        [
+          {
+            "node": "Commande payee et token valide ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Commande payee et token valide ?": {
+      "main": [
+        [
+          {
+            "node": "Une formation de demonstration",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Refus 403",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Une formation de demonstration": {
+      "main": [
+        [
+          {
+            "node": "Moodle : chercher utilisateur",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Moodle : chercher utilisateur": {
+      "main": [
+        [
+          {
+            "node": "Etudiant deja connecte a Moodle ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Etudiant deja connecte a Moodle ?": {
+      "main": [
+        [
+          {
+            "node": "Moodle : chercher cours",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Etudiant absent 422",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Moodle : chercher cours": {
+      "main": [
+        [
+          {
+            "node": "Cours correspondant existe ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cours correspondant existe ?": {
+      "main": [
+        [
+          {
+            "node": "Moodle : inscrire etudiant",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Cours absent 422",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Moodle : inscrire etudiant": {
+      "main": [
+        [
+          {
+            "node": "API inscription sans erreur ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "API inscription sans erreur ?": {
+      "main": [
+        [
+          {
+            "node": "Inscription confirmee",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Erreur inscription 502",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

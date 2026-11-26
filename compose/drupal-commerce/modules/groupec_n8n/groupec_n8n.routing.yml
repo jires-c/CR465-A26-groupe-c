@@ -1,0 +1,7 @@
+groupec_n8n.catalogue:
+  path: '/formations'
+  defaults:
+    _controller: '\Drupal\groupec_n8n\Controller\CatalogueController::catalogue'
+    _title: 'Catalogue des formations'
+  requirements:
+    _permission: 'access content'

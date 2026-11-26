@@ -1,0 +1,15 @@
+# REDIS - BONUS (cache ou sessions selon compatibilite de l application).
+# EMPLACEMENT RESERVE : pas de conteneur lance depuis ce fichier.
+# Redis est une base cle/valeur en memoire: PAS de base PostgreSQL a creer.
+# Secret deja prepare: /opt/GroupeC/secrets/redis_password.
+# Lors de l integration utiliser AUTH/ACL sans exposer le mot de passe
+# dans le compose, les journaux ou GitHub.
+# Connexions autorisees: clients applicatifs seulement sur GroupeC-donnees.
+# Port INTERNE 6379, ne jamais definir de port hote public "6379:6379".
+# Prevoir limites RAM, controle de sante et persistence uniquement si utile.
+# Reseau Compose a reutiliser:
+# networks:
+#   donnees:
+#     external: true
+#     name: GroupeC-donnees
+# Pas de route Traefik: Redis n est pas une application HTTP publique.

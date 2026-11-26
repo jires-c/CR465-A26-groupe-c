@@ -1,0 +1,9 @@
+# Certificat local autosigne genere automatiquement par deploy.sh.
+# Il n est PAS signe par une CA publique: navigateur = avertissement normal.
+tls:
+  certificates:
+    - certFile: /certs/local.crt
+      keyFile: /certs/local.key
+  options:
+    default:
+      minVersion: VersionTLS12

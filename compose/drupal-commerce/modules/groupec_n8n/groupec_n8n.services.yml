@@ -1,0 +1,10 @@
+services:
+  logger.channel.groupec_n8n:
+    parent: logger.channel_base
+    arguments: ['groupec_n8n']
+
+  groupec_n8n.order_subscriber:
+    class: Drupal\groupec_n8n\EventSubscriber\OrderToN8nSubscriber
+    arguments: ['@http_client', '@logger.channel.groupec_n8n']
+    tags:
+      - { name: event_subscriber }

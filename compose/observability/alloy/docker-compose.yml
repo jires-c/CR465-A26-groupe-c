@@ -1,0 +1,40 @@
+name: groupec-alloy
+
+services:
+  alloy:
+    image: grafana/alloy:v1.10.2
+    container_name: groupec-alloy
+    # UID 0 ici = utilisateur ubuntu de l'hote via Docker Rootless (PAS root de l'hote).
+    # Ce choix permet la lecture des journaux rootless en 0640; pas de mode privileged.
+    user: "0:0"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --storage.path=/var/lib/alloy/data
+
+    volumes:
+      - ./config.alloy:/etc/alloy/config.alloy:ro
+      - /home/ubuntu/.local/share/docker/containers:/journaux:ro
+      - alloy_data:/var/lib/alloy/data
+
+    networks:
+      - observabilite
+
+    mem_limit: 512m
+
+volumes:
+  alloy_data:
+
+networks:
+  observabilite:
+    external: true
+    name: GroupeC-observabilite

@@ -1,0 +1,54 @@
+# ==================================================
+# CONFIGURATION ACTIVE - GRAFANA
+# Projet CR465 - GroupeC
+# ==================================================
+
+name: groupec-grafana
+
+services:
+  grafana:
+    image: grafana/grafana:12.3.0
+    container_name: groupec-grafana
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    user: "472:0"
+    group_add:
+      - "1000"
+
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SERVER_ROOT_URL: "https://grafana.groupec.test:4443/"
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - /opt/GroupeC/secrets/grafana_admin_password:/run/secrets/grafana_admin_password:ro
+
+    networks:
+      - applicatif
+      - observabilite
+
+    mem_limit: 512m
+
+volumes:
+  grafana_data:
+
+networks:
+  applicatif:
+    external: true
+    name: GroupeC-applicatif
+
+  observabilite:
+    external: true
+    name: GroupeC-observabilite

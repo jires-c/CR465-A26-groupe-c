@@ -1,0 +1,16 @@
+# Secrets et variables générés sur la VM : JAMAIS dans Git.
+**/secrets/
+*.env
+!*.env.example
+**/.env
+!**/.env.example
+*.key
+*.crt
+*.pem
+ca-bundle.crt
+# Realm Keycloak rendu (contient le secret OIDC injecté)
+compose/keycloak/groupec-realm.json
+# Artefacts
+*.pcap
+media/*
+!media/.gitkeep

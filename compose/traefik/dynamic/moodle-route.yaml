@@ -1,0 +1,43 @@
+# Moodle 5.3 via Traefik : route et middleware du collegue.
+# Domaine canonique moodle.groupec.test ; alias .localhost pour les essais VM.
+http:
+  routers:
+    moodle:
+      rule: (Host(`moodle.groupec.test`) || Host(`moodle.localhost`))
+      entryPoints:
+      - websecure
+      service: moodle-service
+      middlewares:
+      - moodle-headers
+      - moodle-ratelimit
+      tls: {}
+    moodle-login:
+      rule: (Host(`moodle.groupec.test`) || Host(`moodle.localhost`)) && PathPrefix(`/login`)
+      priority: 100
+      entryPoints:
+      - websecure
+      service: moodle-service
+      middlewares:
+      - moodle-headers
+      - moodle-login-ratelimit
+      tls: {}
+  middlewares:
+    moodle-headers:
+      headers:
+        stsSeconds: 31536000
+        contentTypeNosniff: true
+        customFrameOptionsValue: SAMEORIGIN
+        referrerPolicy: strict-origin-when-cross-origin
+    moodle-ratelimit:
+      rateLimit:
+        average: 50
+        burst: 100
+    moodle-login-ratelimit:
+      rateLimit:
+        average: 5
+        burst: 10
+  services:
+    moodle-service:
+      loadBalancer:
+        servers:
+        - url: http://moodle:8080

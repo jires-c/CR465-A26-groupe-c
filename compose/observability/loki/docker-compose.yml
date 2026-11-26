@@ -1,0 +1,39 @@
+# ==================================================
+# CONFIGURATION ACTIVE - LOKI
+# Responsable : observabilite GroupeC
+# ==================================================
+
+name: groupec-loki
+
+services:
+  loki:
+    image: grafana/loki:3.5.5
+    container_name: groupec-loki
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    command:
+      - -config.file=/etc/loki/loki-config.yaml
+
+    volumes:
+      - ./loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki_data:/loki
+
+    networks:
+      - observabilite
+
+    mem_limit: 768m
+
+volumes:
+  loki_data:
+
+networks:
+  observabilite:
+    external: true
+    name: GroupeC-observabilite
