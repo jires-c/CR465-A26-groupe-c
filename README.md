@@ -1,3 +1,9 @@
+## Documentation technique
+
+La documentation complète du projet CR465 – Groupe C
+est disponible sur GitBook.
+
+[Consulter la documentation GitBook](https://app.gitbook.com/o/24kOSjla1s4qLPifxclD/sites/site_oMJxe)
 # Travail de session — Architecture sécurisée d'une plateforme pédagogique conteneurisée sur VM as Code (document consolidé)
 
 > Ce fichier fusionne en un seul document l'énoncé complet du travail de session, la grille de correction détaillée et la grille de correction en format tableau. Il est généré à partir de `md/official_enonce_travail_session_containers.md`, `md/grille_correction_travail_session_containers.md` et `md/grille_correction_tableau.md`, qui demeurent les fichiers sources faisant foi individuellement en cas de divergence.
