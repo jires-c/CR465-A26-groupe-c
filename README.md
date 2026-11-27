@@ -7,7 +7,7 @@ Ce projet déploie une plateforme de formation sécurisée sur une seule VM Ubun
 **Version de référence : V5.5.** L’équipe indique que les tests ont réussi.
 
 La documentation complète du projet CR465 – Groupe C est disponible sur GitBook.
-https://polymtl-1.gitbook.io/polymtl-docs
+[Consulter la documentation GitBook](https://app.gitbook.com/o/24kOSjla1s4qLPifxclD/sites/site_oMJxe)
 
 <!-- https://polymtl-1.gitbook.io/polymtl-docs -->
 
