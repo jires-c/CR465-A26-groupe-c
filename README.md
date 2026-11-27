@@ -5,6 +5,7 @@
 Ce projet déploie une plateforme de formation sécurisée sur une seule VM Ubuntu 24.04 LTS, avec Cloud-init, Docker Rootless et Docker Compose. Moodle utilise Keycloak pour le SSO ; Drupal Commerce et n8n automatisent l’inscription aux formations après confirmation d’un paiement simulé. Traefik centralise les accès HTTPS, PostgreSQL héberge les données et Alloy, Loki et Grafana centralisent les journaux.
 
 **Version de référence : V5.5.** L’équipe indique que les tests ont réussi.
+
 La documentation complète du projet CR465 – Groupe C est disponible sur GitBook.
 https://polymtl-1.gitbook.io/polymtl-docs
 
