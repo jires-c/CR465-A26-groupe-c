@@ -12,18 +12,18 @@ Ce projet déploie une plateforme de formation sécurisée sur une seule VM Ubun
 
 Les chapitres sont consultables directement dans GitHub :
 
-1. [Présentation du projet](docs/presentation.md)
-2. [Architecture globale](docs/architecture.md)
-3. [VM et Cloud-init](docs/vm-cloud-init.md)
-4. [Déploiement Docker Compose](docs/docker-compose.md)
-5. [Segmentation réseau](docs/segmentation-reseau.md)
-6. [Mesures de sécurité](docs/securite.md)
-7. [SSO – Keycloak](docs/sso-keycloak.md)
-8. [Workflow n8n et attribution des accès](docs/workflow-n8n.md)
-9. [Observabilité](docs/observabilite.md)
-10. [Validation et tests](docs/validation.md)
-11. [Limites et risques résiduels](docs/limites-et-risques.md)
-12. [Contributions des membres de l’équipe](docs/contributions.md)
+1. [Présentation du projet](documentation-gitbook/presentation.md)
+2. [Architecture globale](documentation-gitbook/architecture.md)
+3. [VM et Cloud-init](documentation-gitbook/vm-cloud-init.md)
+4. [Déploiement Docker Compose](documentation-gitbook/docker-compose.md)
+5. [Segmentation réseau](documentation-gitbook/segmentation-reseau.md)
+6. [Mesures de sécurité](documentation-gitbook/securite.md)
+7. [SSO – Keycloak](documentation-gitbook/sso-keycloak.md)
+8. [Workflow n8n et attribution des accès](documentation-gitbook/workflow-n8n.md)
+9. [Observabilité](documentation-gitbook/observabilite.md)
+10. [Validation et tests](documentation-gitbook/validation.md)
+11. [Limites et risques résiduels](documentation-gitbook/limites-et-risques.md)
+12. [Contributions des membres de l’équipe](documentation-gitbook/contributions.md)
 
 ## Architecture simplifiée
 
